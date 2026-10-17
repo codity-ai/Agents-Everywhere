@@ -130,6 +130,8 @@ export async function startControl(options: ControlOptions): Promise<RunningCont
         GET: adminOnly((req, p) => admin.getAgent(req, p.id)),
         PATCH: adminOnly((req, p) => admin.updateAgent(req, p.id)),
       },
+      "/api/agents/:id/runs": { GET: adminOnly((req, p) => admin.listRuns(req, p.id)) },
+      "/api/agents/:id/runs/:runId": { GET: adminOnly((req, p) => admin.getRun(req, p.id, p.runId)) },
       "/api/agents/:id/permissions": { PUT: adminOnly((req, p) => admin.replacePermissions(req, p.id)) },
       "/api/agents/:id/install-command": { POST: adminOnly((req, p) => admin.installCommand(req, p.id)) },
       "/api/agents/:id/revoke": { POST: adminOnly((req, p) => admin.revoke(req, p.id)) },

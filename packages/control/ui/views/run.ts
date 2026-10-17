@@ -1,4 +1,4 @@
-import { api, ApiError, type Agent, type RunEvent } from "../api"
+import { api, ApiError, type AgentSummary, type Run, type RunEvent } from "../api"
 import { clock, h, money, replace, replaceIfChanged, toast } from "../dom"
 import { icon } from "../icons"
 import { poll } from "../poll"
@@ -61,10 +61,11 @@ function line(event: RunEvent): HTMLElement | null {
 }
 
 export async function renderRun(main: HTMLElement, agentId: string, runId: string): Promise<() => void> {
-  let agent = await api.get<Agent>(`/api/agents/${agentId}`)
-  const findRun = () => agent.runs.find((r) => r.id === runId)
-  if (!findRun())
-    throw new ApiError(404, "That run is not on this agent, or it is older than the 50 runs kept on the agent page.")
+  const [agent, initialRun] = await Promise.all([
+    api.get<AgentSummary>(`/api/agents/${agentId}`),
+    api.get<Run>(`/api/agents/${agentId}/runs/${runId}`),
+  ])
+  let run = initialRun
 
   const timeline = h("ol", { class: "timeline", "aria-live": "polite", "aria-label": "Transcript" })
   const header = h("div")
@@ -78,7 +79,6 @@ export async function renderRun(main: HTMLElement, agentId: string, runId: strin
         const body = li.querySelector("div")?.textContent ?? ""
         return `${time}  ${body}`.trim()
       })
-      const run = findRun()!
       const text = [`# ${agent.label} on ${run.hostname ?? "an unnamed machine"}`, `Run ${run.id}, ${run.status}`, "", ...lines, ""].join("\n")
       const url = URL.createObjectURL(new Blob([text], { type: "text/plain" }))
       const a = h("a", { href: url, download: `transcript-${run.id.slice(0, 8)}.txt` })
@@ -139,7 +139,6 @@ export async function renderRun(main: HTMLElement, agentId: string, runId: strin
   })
 
   const drawHeader = () => {
-    const run = findRun()!
     const live = isLive(run.status)
     // Rebuilt only when something shown changed, so a refresh never takes
     // focus off the stop button.
@@ -174,9 +173,9 @@ export async function renderRun(main: HTMLElement, agentId: string, runId: strin
   if (!timeline.childElementCount) timeline.appendChild(placeholder)
 
   return poll(REFRESH_MS, async () => {
-    const wasLive = isLive(findRun()!.status)
-    agent = await api.get<Agent>(`/api/agents/${agentId}`)
-    if (wasLive || isLive(findRun()!.status)) await loadEvents()
+    const wasLive = isLive(run.status)
+    run = await api.get<Run>(`/api/agents/${agentId}/runs/${runId}`)
+    if (wasLive || isLive(run.status)) await loadEvents()
     drawHeader()
   })
 }

@@ -36,8 +36,10 @@ export function loadKeys(dataDir: string): Keys {
     if (!fs.existsSync(file)) {
       fs.writeFileSync(file, crypto.randomBytes(SECRET_BYTES), { mode: 0o600, flag: "wx" })
     }
-    const mode = fs.statSync(file).mode & 0o077
-    if (mode !== 0) throw new Error(`${file} is readable by other users; run: chmod 600 ${file}`)
+    if (process.platform !== "win32") {
+      const mode = fs.statSync(file).mode & 0o077
+      if (mode !== 0) throw new Error(`${file} is readable by other users; run: chmod 600 ${file}`)
+    }
     secret = fs.readFileSync(file)
   }
   return { signing: derive(secret, "tokens"), encryption: derive(secret, "llm-keys") }

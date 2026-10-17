@@ -228,3 +228,228 @@ describe("listening safely", () => {
     expect(() => resolveOptions({ hostname: "0.0.0.0", insecure: true }, () => {})).toThrow(/--public-url/)
   })
 })
+
+describe("paginated run history and direct lookup", () => {
+  test("direct lookup opens oldest of at least 51 stored runs and accesses its transcript", async () => {
+    const res = await admin("POST", "/api/agents", {
+      label: "agent-51",
+      task: "task",
+      model_provider: "anthropic",
+      model_name: "claude",
+    })
+    const agent = (await res.json()) as any
+    const db = new Database(path.join(dataDir, "control.db"))
+    try {
+      // Insert 55 runs with decreasing timestamps (run 0 is newest, run 54 is oldest)
+      const baseTime = Date.parse("2026-05-01T12:00:00.000Z")
+      const runIds: string[] = []
+      for (let i = 0; i < 55; i++) {
+        const runId = `run-${i.toString().padStart(3, "0")}`
+        runIds.push(runId)
+        const createdAt = new Date(baseTime - i * 1000).toISOString()
+        db.query(
+          "INSERT INTO runs (id, agent_id, status, hostname, created_at) VALUES (?, ?, 'succeeded', 'worker-1', ?)",
+        ).run(runId, agent.id, createdAt)
+      }
+
+      const oldestRunId = runIds[54] // 55th run
+      control.store.addEvent(oldestRunId, "step", { kind: "reply", message: "Oldest run transcript message" })
+
+      // 1. Agent detail response returns only the latest 50 runs (existing client contract)
+      const detailRes = await admin("GET", `/api/agents/${agent.id}`)
+      expect(detailRes.status).toBe(200)
+      const detail = (await detailRes.json()) as any
+      expect(detail.runs.length).toBe(50)
+      expect(detail.runs.some((r: any) => r.id === oldestRunId)).toBe(false)
+
+      // 2. Direct lookup for the oldest run returns 200 and the run data
+      const directRes = await admin("GET", `/api/agents/${agent.id}/runs/${oldestRunId}`)
+      expect(directRes.status).toBe(200)
+      const directRun = (await directRes.json()) as any
+      expect(directRun.id).toBe(oldestRunId)
+      expect(directRun.status).toBe("succeeded")
+
+      // 3. Transcript events for the oldest run are accessible
+      const eventsRes = await admin("GET", `/api/agents/${agent.id}/runs/${oldestRunId}/events`)
+      expect(eventsRes.status).toBe(200)
+      const events = (await eventsRes.json()) as any
+      expect(events.length).toBeGreaterThan(0)
+      expect(events[0].payload.message).toBe("Oldest run transcript message")
+    } finally {
+      db.close()
+    }
+  })
+
+  test("browsing history in bounded pages with stable ordering and cursor pagination", async () => {
+    const res = await admin("POST", "/api/agents", {
+      label: "agent-pages",
+      task: "task",
+      model_provider: "anthropic",
+      model_name: "claude",
+    })
+    const agent = (await res.json()) as any
+    const db = new Database(path.join(dataDir, "control.db"))
+    try {
+      const baseTime = Date.parse("2026-06-01T12:00:00.000Z")
+      const allRunIds: string[] = []
+      for (let i = 0; i < 55; i++) {
+        const runId = `run-page-${i.toString().padStart(3, "0")}`
+        allRunIds.push(runId)
+        const createdAt = new Date(baseTime - i * 1000).toISOString()
+        db.query(
+          "INSERT INTO runs (id, agent_id, status, hostname, created_at) VALUES (?, ?, 'succeeded', 'worker-1', ?)",
+        ).run(runId, agent.id, createdAt)
+      }
+
+      // Insert pending install-command runs: these should not consume slots or affect total count
+      db.query(
+        "INSERT INTO runs (id, agent_id, status, created_at) VALUES ('pending-run-1', ?, 'pending', ?)",
+      ).run(agent.id, new Date(baseTime + 10000).toISOString())
+      db.query(
+        "INSERT INTO runs (id, agent_id, status, created_at) VALUES ('pending-run-2', ?, 'pending', ?)",
+      ).run(agent.id, new Date(baseTime + 20000).toISOString())
+
+      // Detail exposes total_runs excluding pending
+      const detailRes = await admin("GET", `/api/agents/${agent.id}`)
+      expect(detailRes.status).toBe(200)
+      const detail = (await detailRes.json()) as any
+      expect(detail.total_runs).toBe(55)
+
+      // Page 1 (limit 20)
+      const page1Res = await admin("GET", `/api/agents/${agent.id}/runs?limit=20`)
+      expect(page1Res.status).toBe(200)
+      const page1 = (await page1Res.json()) as any
+      expect(page1.runs.length).toBe(20)
+      expect(page1.total).toBe(55)
+      expect(page1.has_more).toBe(true)
+      expect(page1.next_cursor).toBeTruthy()
+      expect(page1.runs.some((r: any) => r.status === "pending")).toBe(false)
+      expect(page1.runs.map((r: any) => r.id)).toEqual(allRunIds.slice(0, 20))
+
+      // Page 2 (limit 20)
+      const page2Res = await admin(
+        "GET",
+        `/api/agents/${agent.id}/runs?limit=20&cursor=${encodeURIComponent(page1.next_cursor)}`,
+      )
+      expect(page2Res.status).toBe(200)
+      const page2 = (await page2Res.json()) as any
+      expect(page2.runs.length).toBe(20)
+      expect(page2.total).toBe(55)
+      expect(page2.has_more).toBe(true)
+      expect(page2.next_cursor).toBeTruthy()
+      expect(page2.runs.map((r: any) => r.id)).toEqual(allRunIds.slice(20, 40))
+
+      // Page 3 (limit 20, remaining 15)
+      const page3Res = await admin(
+        "GET",
+        `/api/agents/${agent.id}/runs?limit=20&cursor=${encodeURIComponent(page2.next_cursor)}`,
+      )
+      expect(page3Res.status).toBe(200)
+      const page3 = (await page3Res.json()) as any
+      expect(page3.runs.length).toBe(15)
+      expect(page3.total).toBe(55)
+      expect(page3.has_more).toBe(false)
+      expect(page3.next_cursor).toBeNull()
+      expect(page3.runs.map((r: any) => r.id)).toEqual(allRunIds.slice(40, 55))
+    } finally {
+      db.close()
+    }
+  })
+
+  test("stable tie-breaker for equal timestamps and newly inserted runs do not duplicate", async () => {
+    const res = await admin("POST", "/api/agents", {
+      label: "agent-tiebreak",
+      task: "task",
+      model_provider: "anthropic",
+      model_name: "claude",
+    })
+    const agent = (await res.json()) as any
+    const db = new Database(path.join(dataDir, "control.db"))
+    try {
+      const sameTime = "2026-07-01T12:00:00.000Z"
+      // Insert 4 runs with exact same timestamp
+      const ids = ["run-tie-d", "run-tie-c", "run-tie-b", "run-tie-a"]
+      for (const id of ids) {
+        db.query(
+          "INSERT INTO runs (id, agent_id, status, hostname, created_at) VALUES (?, ?, 'succeeded', 'worker-1', ?)",
+        ).run(id, agent.id, sameTime)
+      }
+
+      // Page 1 with limit 2
+      const p1Res = await admin("GET", `/api/agents/${agent.id}/runs?limit=2`)
+      const p1 = (await p1Res.json()) as any
+      expect(p1.runs.length).toBe(2)
+      // ID tie-breaker is DESC: 'run-tie-d', 'run-tie-c'
+      expect(p1.runs[0].id).toBe("run-tie-d")
+      expect(p1.runs[1].id).toBe("run-tie-c")
+      expect(p1.has_more).toBe(true)
+
+      // Insert brand new runs with newer timestamps while paginating
+      db.query(
+        "INSERT INTO runs (id, agent_id, status, hostname, created_at) VALUES (?, ?, 'succeeded', 'worker-1', '2026-07-02T00:00:00.000Z')",
+      ).run("run-new-1", agent.id)
+
+      // Page 2 using cursor from Page 1
+      const p2Res = await admin(
+        "GET",
+        `/api/agents/${agent.id}/runs?limit=2&cursor=${encodeURIComponent(p1.next_cursor)}`,
+      )
+      const p2 = (await p2Res.json()) as any
+      expect(p2.runs.length).toBe(2)
+      // Runs 'run-tie-b', 'run-tie-a' must be returned, not the newly inserted run and not duplicate p1
+      expect(p2.runs[0].id).toBe("run-tie-b")
+      expect(p2.runs[1].id).toBe("run-tie-a")
+      expect(p2.has_more).toBe(false)
+    } finally {
+      db.close()
+    }
+  })
+
+  test("verifies authentication and agent/run ownership", async () => {
+    const a1 = (await (
+      await admin("POST", "/api/agents", { label: "a1", task: "t", model_provider: "anthropic", model_name: "claude" })
+    ).json()) as any
+    const a2 = (await (
+      await admin("POST", "/api/agents", { label: "a2", task: "t", model_provider: "anthropic", model_name: "claude" })
+    ).json()) as any
+    const db = new Database(path.join(dataDir, "control.db"))
+    try {
+      db.query("INSERT INTO runs (id, agent_id, status, created_at) VALUES ('r-a1', ?, 'succeeded', ?)").run(
+        a1.id,
+        "2026-01-01T00:00:00.000Z",
+      )
+      db.query("INSERT INTO runs (id, agent_id, status, created_at) VALUES ('r-a2', ?, 'succeeded', ?)").run(
+        a2.id,
+        "2026-01-01T00:00:00.000Z",
+      )
+
+      // Unauthenticated requests are rejected
+      expect((await fetch(`${base}/api/agents/${a1.id}/runs`)).status).toBe(401)
+      expect((await fetch(`${base}/api/agents/${a1.id}/runs/r-a1`)).status).toBe(401)
+
+      // Mismatched agent and run returns 404
+      const mismatchRes = await admin("GET", `/api/agents/${a1.id}/runs/r-a2`)
+      expect(mismatchRes.status).toBe(404)
+      expect((await mismatchRes.json()).detail).toContain("Run not found on this agent")
+
+      // Non-existent run on valid agent returns 404
+      const missingRun = await admin("GET", `/api/agents/${a1.id}/runs/no-such-run`)
+      expect(missingRun.status).toBe(404)
+
+      // Non-existent agent returns 404
+      expect((await admin("GET", "/api/agents/no-such-agent/runs")).status).toBe(404)
+      expect((await admin("GET", "/api/agents/no-such-agent/runs/r-a1")).status).toBe(404)
+
+      // Invalid pagination cursor returns 400
+      const badCursor = await admin("GET", `/api/agents/${a1.id}/runs?cursor=invalid!`)
+      expect(badCursor.status).toBe(400)
+
+      // Explicit empty pagination cursor returns 400
+      const emptyCursor = await admin("GET", `/api/agents/${a1.id}/runs?cursor=`)
+      expect(emptyCursor.status).toBe(400)
+      expect((await emptyCursor.json()).detail).toContain("Invalid pagination cursor")
+    } finally {
+      db.close()
+    }
+  })
+})

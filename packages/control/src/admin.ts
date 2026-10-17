@@ -35,6 +35,8 @@ import type { AgentRow, RunRow, SecretInput, Store } from "./store"
 
 const MAX_ADMIN_BODY_BYTES = 1024 * 1024
 const RUNS_SHOWN = 50
+const DEFAULT_RUNS_PAGE = 20
+const MAX_RUNS_PAGE = 100
 const EVENTS_PAGE = 1000
 
 const AWS_SECRET_ARN = /^arn:aws:secretsmanager:[a-z0-9-]+:\d{12}:secret:.+$/
@@ -162,6 +164,35 @@ function runOut(run: RunRow) {
   }
 }
 
+export interface RunCursor {
+  created_at: string
+  id: string
+}
+
+export function encodeCursor(cursor: RunCursor): string {
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url")
+}
+
+export function decodeCursor(raw: string): RunCursor {
+  try {
+    const jsonStr = Buffer.from(raw, "base64url").toString("utf8")
+    const parsed = JSON.parse(jsonStr)
+    if (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      typeof parsed.created_at === "string" &&
+      parsed.created_at.length > 0 &&
+      typeof parsed.id === "string" &&
+      parsed.id.length > 0
+    ) {
+      return { created_at: parsed.created_at, id: parsed.id }
+    }
+  } catch {
+    // handled by throw
+  }
+  throw new HttpError(400, "Invalid pagination cursor")
+}
+
 function agentOut(agent: AgentRow) {
   return {
     id: agent.id,
@@ -220,6 +251,7 @@ export class AdminApi {
         provider_config: parseJson(s.provider_config, {}),
       })),
       runs: this.store.runs(agent.id, RUNS_SHOWN).map(runOut),
+      total_runs: this.store.agentRunCount(agent.id),
       pending_permission_requests: this.store.requests(agent.id, true, 500).length,
       total_cost_usd: usage.cost ?? 0,
       total_tokens_in: usage.tokens_in ?? 0,
@@ -379,6 +411,41 @@ export class AdminApi {
     const runsSignaled = this.store.revokeAgent(id)
     this.log(`Agent ${id} revoked; ${runsSignaled} run(s) told to stop`)
     return json({ status: "revoked", runs_signaled: runsSignaled })
+  }
+
+  listRuns = async (req: Request, id: string): Promise<Response> => {
+    this.agentOr404(id)
+    const url = new URL(req.url)
+    const limitParam = url.searchParams.get("limit")
+    let limit = DEFAULT_RUNS_PAGE
+    if (limitParam !== null) {
+      const parsed = Number(limitParam)
+      if (!Number.isInteger(parsed) || parsed < 1 || parsed > MAX_RUNS_PAGE) {
+        throw new HttpError(400, `limit must be an integer between 1 and ${MAX_RUNS_PAGE}`)
+      }
+      limit = parsed
+    }
+    const cursorParam = url.searchParams.get("cursor")
+    const cursor = cursorParam !== null ? decodeCursor(cursorParam) : null
+    const result = this.store.runsPaginated(
+      id,
+      limit,
+      cursor ? { createdAt: cursor.created_at, id: cursor.id } : null,
+    )
+    return json({
+      runs: result.runs.map(runOut),
+      total: result.total,
+      next_cursor: result.nextCursor
+        ? encodeCursor({ created_at: result.nextCursor.createdAt, id: result.nextCursor.id })
+        : null,
+      has_more: result.hasMore,
+    })
+  }
+
+  getRun = async (_req: Request, id: string, runId: string): Promise<Response> => {
+    this.agentOr404(id)
+    const run = this.runOr404(id, runId)
+    return json(runOut(run))
   }
 
   runEvents = async (req: Request, id: string, runId: string): Promise<Response> => {

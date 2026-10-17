@@ -1,4 +1,4 @@
-import { api, ApiError, type Agent, type PermissionRequest } from "../api"
+import { api, ApiError, type Agent, type PaginatedRuns, type PermissionRequest, type Run } from "../api"
 import { agoNode, h, money, refreshTimes, replace, replaceIfChanged, toast } from "../dom"
 import { icon } from "../icons"
 import { poll } from "../poll"
@@ -110,58 +110,104 @@ export async function renderDetail(main: HTMLElement, id: string): Promise<() =>
     for (const req of pending) seen.add(req.id)
   }
 
+  const RUNS_PAGE_SIZE = 20
+  let pageIndex = 0
+  let pageCursors: Array<string | null> = [null]
+  let currentRuns: Run[] = []
+  let totalRuns = agent.total_runs ?? agent.runs.filter((r) => r.status !== "pending").length
+  let hasMore = false
+  let nextCursor: string | null = null
+
+  const loadRunsPage = async (index: number) => {
+    const cursor = pageCursors[index]
+    const url = `/api/agents/${id}/runs?limit=${RUNS_PAGE_SIZE}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`
+    const res = await api.get<PaginatedRuns>(url)
+    pageIndex = index
+    currentRuns = res.runs.filter((r) => r.status !== "pending")
+    if (typeof res.total === "number") {
+      totalRuns = res.total
+    }
+    hasMore = res.has_more
+    nextCursor = res.next_cursor
+    // Replace forward cursor for the current page and discard any beyond
+    pageCursors = pageCursors.slice(0, index + 1)
+    if (nextCursor) {
+      pageCursors.push(nextCursor)
+    }
+    drawRuns()
+  }
+
   const drawRuns = () => {
-    const runs = agent.runs.filter((r) => r.status !== "pending")
-    const live = runs.filter((r) => isLive(r.status)).length
-    replaceIfChanged(band, `${agent.total_cost_usd}:${agent.total_tokens_in}:${agent.total_tokens_out}:${live}:${runs.length}`, () => [
+    const live = agent.runs.filter((r) => isLive(r.status)).length
+    const runs = currentRuns
+    const totalRunsCount = totalRuns
+    replaceIfChanged(band, `${agent.total_cost_usd}:${agent.total_tokens_in}:${agent.total_tokens_out}:${live}:${totalRunsCount}`, () => [
       h(
         "div",
         { class: "stat-row" },
         stat("Spend", money(agent.total_cost_usd)),
-        stat("Runs", String(runs.length)),
+        stat("Runs", String(totalRunsCount)),
         stat("Running now", String(live)),
         stat("Tokens", (agent.total_tokens_in + agent.total_tokens_out).toLocaleString()),
       ),
     ])
-    if (runs.length === 0) {
+    if (pageIndex === 0 && runs.length === 0 && !hasMore) {
       replaceIfChanged(runsBody, "none", () => [h("p", { class: "panel-body muted" }, "No machine has run this agent yet.")])
       return
     }
-    const key = runs.map((r) => `${r.id}:${r.status}:${r.kill_requested}:${r.last_heartbeat_at ? 1 : 0}`).join(",")
+
+    const tableRows = runs.map((run) =>
+      h(
+        "tr",
+        {},
+        h(
+          "td",
+          { "data-label": "Machine" },
+          h("a", { class: "name-link", href: `#/agents/${id}/runs/${run.id}` }, run.hostname ?? "Unnamed machine"),
+        ),
+        h(
+          "td",
+          { "data-label": "Status" },
+          run.kill_requested && isLive(run.status)
+            ? h("span", { class: "status", "data-tone": "warning" }, "Stopping")
+            : runStatus(run.status),
+        ),
+        h(
+          "td",
+          { "data-label": "Last heard" },
+          h("span", { class: "hint" }, agoNode(run.last_heartbeat_at ?? run.created_at, { "data-heard": run.id })),
+        ),
+      ),
+    )
+
+    const prevBtn = button("Previous", {
+      disabled: pageIndex === 0,
+      onclick: () => void loadRunsPage(pageIndex - 1),
+    })
+    const nextBtn = button("Next", {
+      disabled: !hasMore,
+      onclick: () => void loadRunsPage(pageIndex + 1),
+    })
+
+    const paginationBar = (pageIndex > 0 || hasMore)
+      ? h(
+          "div",
+          { class: "pagination-bar" },
+          h("div", { class: "pagination-nav" }, prevBtn, h("span", { class: "hint" }, `Page ${pageIndex + 1}`), nextBtn),
+          !hasMore ? h("span", { class: "hint" }, "End of run history") : null,
+        )
+      : h("div", { class: "end-of-history" }, h("span", { class: "hint" }, "End of run history"))
+
+    const key = `${pageIndex}:${hasMore}:${runs.map((r) => `${r.id}:${r.status}:${r.kill_requested}:${r.last_heartbeat_at ? 1 : 0}`).join(",")}`
     replaceIfChanged(runsBody, key, () => [
       h(
         "table",
         { class: "grid-table" },
         h("caption", { class: "visually-hidden" }, "Runs"),
         h("thead", {}, h("tr", {}, h("th", {}, "Machine"), h("th", {}, "Status"), h("th", {}, "Last heard"))),
-        h(
-          "tbody",
-          {},
-          ...runs.map((run) =>
-            h(
-              "tr",
-              {},
-              h(
-                "td",
-                { "data-label": "Machine" },
-                h("a", { class: "name-link", href: `#/agents/${id}/runs/${run.id}` }, run.hostname ?? "Unnamed machine"),
-              ),
-              h(
-                "td",
-                { "data-label": "Status" },
-                run.kill_requested && isLive(run.status)
-                  ? h("span", { class: "status", "data-tone": "warning" }, "Stopping")
-                  : runStatus(run.status),
-              ),
-              h(
-                "td",
-                { "data-label": "Last heard" },
-                h("span", { class: "hint" }, agoNode(run.last_heartbeat_at ?? run.created_at, { "data-heard": run.id })),
-              ),
-            ),
-          ),
-        ),
+        h("tbody", {}, ...tableRows),
       ),
+      paginationBar,
     ])
     // The table is rebuilt only when a run changes state; when each was last
     // heard changes every beat, so that is updated where it stands.
@@ -174,6 +220,24 @@ export async function renderDetail(main: HTMLElement, id: string): Promise<() =>
   const refresh = async () => {
     agent = await api.get<Agent>(`/api/agents/${id}`)
     drawRules()
+    const cursor = pageCursors[pageIndex]
+    const url = `/api/agents/${id}/runs?limit=${RUNS_PAGE_SIZE}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`
+    const res = await api.get<PaginatedRuns>(url)
+    currentRuns = res.runs.filter((r) => r.status !== "pending")
+    if (typeof res.total === "number") {
+      totalRuns = res.total
+    } else if (typeof agent.total_runs === "number") {
+      totalRuns = agent.total_runs
+    } else {
+      totalRuns = agent.runs.filter((r) => r.status !== "pending").length
+    }
+    hasMore = res.has_more
+    nextCursor = res.next_cursor
+    // Replace forward cursor for the current page and discard any beyond
+    pageCursors = pageCursors.slice(0, pageIndex + 1)
+    if (nextCursor) {
+      pageCursors.push(nextCursor)
+    }
     drawRuns()
     await drawApprovals()
     refreshTimes(main)
@@ -306,6 +370,7 @@ export async function renderDetail(main: HTMLElement, id: string): Promise<() =>
       ),
     ),
   )
+  await loadRunsPage(0)
   drawRules()
   drawRuns()
   await drawApprovals()

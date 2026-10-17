@@ -1393,6 +1393,29 @@ textarea.input {
   box-shadow: var(--shadow-float);
 }
 
+/* ── Pagination ─────────────────────────────────────────────────────────── */
+
+.pagination-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
+  padding: var(--space-md) var(--card-pad);
+  border-top: 1px solid var(--border);
+}
+
+.pagination-nav {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+}
+
+.end-of-history {
+  padding: var(--space-md) var(--card-pad);
+  text-align: center;
+  border-top: 1px solid var(--border);
+}
+
 @media (max-width: 560px) {
   .topbar,
   main {
