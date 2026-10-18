@@ -30,18 +30,28 @@ interface OutboxData {
 const SENSITIVE_KEYS = /^(password|token|secret|apiKey|api_key|authorization|bearer|auth|cookie|key)$/i
 const BEARER_PATTERN = /(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi
 
+/** Recursively sanitize a single value (string, object, or array). */
+function sanitizeValue(v: unknown): unknown {
+  if (typeof v === "string") {
+    return v.replace(BEARER_PATTERN, "$1[REDACTED]")
+  }
+  if (Array.isArray(v)) {
+    return v.map(sanitizeValue)
+  }
+  if (v && typeof v === "object") {
+    return sanitizePayload(v as Record<string, unknown>)
+  }
+  return v
+}
+
 /** Never persist raw credential values in the on-disk outbox. */
 export function sanitizePayload(obj: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {}
   for (const [k, v] of Object.entries(obj)) {
     if (SENSITIVE_KEYS.test(k)) {
       out[k] = "[REDACTED]"
-    } else if (typeof v === "string") {
-      out[k] = v.replace(BEARER_PATTERN, "$1[REDACTED]")
-    } else if (v && typeof v === "object" && !Array.isArray(v)) {
-      out[k] = sanitizePayload(v as Record<string, unknown>)
     } else {
-      out[k] = v
+      out[k] = sanitizeValue(v)
     }
   }
   return out
@@ -112,12 +122,39 @@ export class DurableOutbox {
       try {
         fs.renameSync(tmpPath, this.filePath)
       } catch {
+        // Cross-device or locked rename: move the existing file aside so we
+        // never delete it before confirming the replacement succeeds.
+        const backupPath = `${this.filePath}.${process.pid}.bak`
+        let backedUp = false
         try {
-          fs.unlinkSync(this.filePath)
+          if (fs.existsSync(this.filePath)) {
+            fs.renameSync(this.filePath, backupPath)
+            backedUp = true
+          }
         } catch {
-          /* ignore */
+          /* if we cannot move the old file aside, try the rename anyway */
         }
-        fs.renameSync(tmpPath, this.filePath)
+        try {
+          fs.renameSync(tmpPath, this.filePath)
+          // Replacement succeeded; remove the backup
+          if (backedUp) {
+            try {
+              fs.unlinkSync(backupPath)
+            } catch {
+              /* best effort */
+            }
+          }
+        } catch (renameErr) {
+          // Replacement failed — restore the backup so the old data is preserved
+          if (backedUp) {
+            try {
+              fs.renameSync(backupPath, this.filePath)
+            } catch {
+              /* last resort: at least the backup file survives on disk */
+            }
+          }
+          throw renameErr
+        }
       }
       return true
     } catch (err: any) {

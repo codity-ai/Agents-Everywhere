@@ -156,10 +156,30 @@ test("reusing event identity with different payload is rejected explicitly with 
 test("terminal runs reject pending and replayed events with 409", async () => {
   const { runId, runToken } = setupAgentAndRun()
 
-  // Finish run as succeeded
+  const eventPayload = {
+    event_id: "evt_before_terminal",
+    event_type: "step",
+    payload: { message: "Accepted while active" },
+    tokens_in: 10,
+    tokens_out: 10,
+    cost_usd: 0.001,
+  }
+
+  // 1. Post an event while the run is still active
+  const accepted = await postEvent(runToken, eventPayload)
+  expect(accepted.status).toBe(200)
+  expect(store.events(runId).length).toBe(1)
+
+  // 2. Finish run as succeeded
   store.endRun(runId, "succeeded")
 
-  const eventPayload = {
+  // 3. Replay the same event after terminal — must be rejected
+  const replay = await postEvent(runToken, eventPayload)
+  expect(replay.status).toBe(409)
+  expect(replay.data.detail).toContain("already succeeded")
+
+  // 4. Post a brand-new event after terminal — must also be rejected
+  const newEvent = {
     event_id: "evt_late_1",
     event_type: "step",
     payload: { message: "Too late" },
@@ -168,12 +188,13 @@ test("terminal runs reject pending and replayed events with 409", async () => {
     cost_usd: 0.001,
   }
 
-  const res = await postEvent(runToken, eventPayload)
+  const res = await postEvent(runToken, newEvent)
   expect(res.status).toBe(409)
   expect(res.data.detail).toContain("already succeeded")
 
-  // Ensure no event was stored
-  expect(store.events(runId).length).toBe(0)
+  // Ensure only the pre-terminal event was stored
+  expect(store.events(runId).length).toBe(1)
+  expect(store.events(runId)[0].id).toBe("evt_before_terminal")
 })
 
 test("reaped lost runs reject pending events with 409", async () => {

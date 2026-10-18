@@ -46,6 +46,44 @@ test("sanitizePayload redacts sensitive keys and bearer tokens", () => {
   expect((sanitized.message as string)).not.toContain("secret_1234567890abcdef")
 })
 
+test("sanitizePayload redacts sensitive values inside arrays", () => {
+  const input = {
+    headers: [
+      { authorization: "Bearer sk-secret", name: "auth" },
+      { token: "tok_value", name: "refresh" },
+    ],
+    messages: [
+      "Use Bearer abc123xyz to authenticate",
+      "Safe message",
+    ],
+    nested: [
+      [{ apiKey: "key_inside_nested_array" }],
+    ],
+    plain: [1, 2, null, true],
+  }
+  const sanitized = sanitizePayload(input)
+
+  // Object elements inside arrays should have sensitive keys redacted
+  const headers = sanitized.headers as any[]
+  expect(headers[0].authorization).toBe("[REDACTED]")
+  expect(headers[0].name).toBe("auth")
+  expect(headers[1].token).toBe("[REDACTED]")
+  expect(headers[1].name).toBe("refresh")
+
+  // String elements inside arrays should have bearer tokens redacted
+  const messages = sanitized.messages as string[]
+  expect(messages[0]).toContain("Bearer [REDACTED]")
+  expect(messages[0]).not.toContain("abc123xyz")
+  expect(messages[1]).toBe("Safe message")
+
+  // Nested arrays should be recursively sanitized
+  const nested = sanitized.nested as any[][]
+  expect(nested[0][0].apiKey).toBe("[REDACTED]")
+
+  // Primitives pass through unchanged
+  expect(sanitized.plain).toEqual([1, 2, null, true])
+})
+
 test("outbox persists events before sending and uses restrictive permissions", async () => {
   const client = new RunnerClient("http://127.0.0.1:9999", "test-token")
   const outbox = new DurableOutbox(client, "test-run", () => {}, outboxPath)
