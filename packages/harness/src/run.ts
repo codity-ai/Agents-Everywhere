@@ -33,6 +33,7 @@ import {
   type Usage,
 } from "./protocol"
 import { resolveSecretEnvVars } from "./secrets"
+import { DurableOutbox, recoverOutbox } from "./outbox"
 
 const HEARTBEAT_INTERVAL_MS = 10_000
 // While a decision is outstanding the agent is blocked, so the beat speeds up
@@ -45,13 +46,22 @@ const WAITING_HEARTBEAT_INTERVAL_MS = 2_000
 // machine started before a feature existed keeps running without it. Saying
 // what is supported lets a control plane tell a person which machine needs a
 // restart instead of guessing from a transcript.
-export const RUNNER_CAPABILITIES = ["transcript", "messages"]
+export const RUNNER_CAPABILITIES = ["transcript", "messages", "durable_events"]
 
 /** Runs the runner command line. Resolves with the process exit code. */
 export async function runRunner(argv: string[], extensions: readonly RunnerExtension[] = []): Promise<number> {
   const args = parseArgs(argv)
 
   if (args.preflight) return (await runPreflight(args.apiUrl)) ? 0 : 1
+
+  if (args.recoverOutbox) {
+    if (!args.token) {
+      log("Missing --token for outbox recovery.")
+      return 1
+    }
+    const res = await recoverOutbox(args.apiUrl, args.token, args.recoverOutbox)
+    return res.remaining === 0 ? 0 : 1
+  }
 
   if (!args.token) {
     log("Missing --token. This command is meant to be copied from the control plane's install command.")
@@ -80,6 +90,7 @@ export async function runRunner(argv: string[], extensions: readonly RunnerExten
 
 class Run {
   private readonly client: RunnerClient
+  private readonly outbox: DurableOutbox
   private readonly cwd = process.cwd()
   private readonly permissionMode: "strict" | "request"
   // Only used to name this run's local files; a random id keeps concurrent runs
@@ -105,12 +116,13 @@ class Run {
     this.client = new RunnerClient(apiUrl, handshake.run_token)
     this.permissionMode = handshake.permission_mode === "request" ? "request" : "strict"
     this.fileId = handshake.run_id || crypto.randomBytes(8).toString("hex")
+    this.outbox = new DurableOutbox(this.client, this.fileId, log)
   }
 
-  private postEvent = (eventType: EventType, payload: Record<string, unknown> | string, usage?: Usage) =>
-    this.client
-      .postEvent(eventType, typeof payload === "string" ? { message: payload } : payload, usage)
-      .catch((err) => log(`Failed to post event: ${err}`))
+  private postEvent = async (eventType: EventType, payload: Record<string, unknown> | string, usage?: Usage) => {
+    const data = typeof payload === "string" ? { message: payload } : payload
+    return this.outbox.enqueue(eventType, data, usage)
+  }
 
   private async finish(status: FinishStatus, message: string) {
     const res = await this.client.finish(status, message).catch((err) => ({ status: 0, data: { detail: String(err) } }))
@@ -123,6 +135,7 @@ class Run {
   private stopAgent(reason: string) {
     if (this.killed) return
     this.killed = true
+    this.outbox.stop()
     log(reason)
     if (this.activeChild) this.activeChild.kill("SIGTERM")
   }
@@ -203,7 +216,9 @@ class Run {
     if (this.activeChild) this.activeChild.kill("SIGTERM")
     // process.exit skips the run's finally, so the config is removed here too.
     this.removeEngineConfig()
+    await this.outbox.flush(3_000)
     await this.finish("killed", `stopped by ${signal}`)
+    this.outbox.cleanup()
     process.exit(1)
   }
 
@@ -411,10 +426,15 @@ class Run {
     clearTimeout(this.heartbeatTimer)
 
     if (this.killed) {
+      await this.outbox.flush(5_000)
       await this.finish("killed", "stopped by operator")
+      this.outbox.cleanup()
       log("Run stopped.")
       return 0
     }
+
+    // Flush any pending events before finishing so transcript and usage are complete
+    await this.outbox.flush(15_000)
 
     // "Nothing happened for a minute" and "the work finished" are different
     // outcomes, and only one of them is a success.
@@ -428,7 +448,10 @@ class Run {
           : "Task completed."
       : `${mode} failed (exit code ${result.exitCode}). ${result.error || ""}`.trim()
     const finished = await this.finish(status, message)
-    if (finished.status === 200) log(`Run ${status}.`)
+    if (finished.status === 200) {
+      log(`Run ${status}.`)
+      this.outbox.cleanup()
+    }
     return result.success && finished.status === 200 ? 0 : 1
   }
 }

@@ -456,13 +456,18 @@ export class Store {
 
   // ── Events ──────────────────────────────────────────────────────────────
 
+  getEvent(id: string): EventRow | null {
+    return this.db.query<EventRow, [string]>("SELECT * FROM events WHERE id = ?").get(id)
+  }
+
   addEvent(
     runId: string,
     type: EventType,
     payload: unknown,
     usage: { tokensIn?: number; tokensOut?: number; costUsd?: number | null } = {},
+    eventId?: string,
   ) {
-    const id = uuid()
+    const id = eventId ?? uuid()
     this.db
       .query(
         `INSERT INTO events (id, run_id, event_type, payload, tokens_in, tokens_out, cost_usd, created_at)
@@ -478,7 +483,7 @@ export class Store {
         usage.costUsd ?? null,
         nowIso(),
       )
-    return this.db.query<EventRow, [string]>("SELECT * FROM events WHERE id = ?").get(id)!
+    return this.getEvent(id)!
   }
 
   events(runId: string, afterSeq = 0, limit = 1000): EventRow[] {

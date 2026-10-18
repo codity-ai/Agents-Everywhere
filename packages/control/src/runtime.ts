@@ -51,6 +51,7 @@ const HeartbeatBody = z.object({
 })
 
 const EventBody = z.object({
+  event_id: z.string().min(1).max(128).optional(),
   event_type: z.enum(RUNNER_EVENT_TYPES as [string, ...string[]]),
   payload: z.record(z.string(), z.unknown()).default({}),
   tokens_in: z.number().int().min(0).default(0),
@@ -69,6 +70,27 @@ const PermissionRequestBody = z.object({
   patterns: z.array(z.string().max(2000)).max(100).default([]),
   metadata: z.record(z.string(), z.unknown()).default({}),
 })
+
+function isDeepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (a === null || typeof a !== "object" || b === null || typeof b !== "object") return false
+  if (Array.isArray(a) !== Array.isArray(b)) return false
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length) return false
+    for (let i = 0; i < a.length; i++) {
+      if (!isDeepEqual(a[i], b[i])) return false
+    }
+    return true
+  }
+  const keysA = Object.keys(a as object)
+  const keysB = Object.keys(b as object)
+  if (keysA.length !== keysB.length) return false
+  for (const key of keysA) {
+    if (!Object.prototype.hasOwnProperty.call(b, key)) return false
+    if (!isDeepEqual((a as Record<string, unknown>)[key], (b as Record<string, unknown>)[key])) return false
+  }
+  return true
+}
 
 export class RuntimeApi {
   constructor(
@@ -123,6 +145,10 @@ export class RuntimeApi {
     const runToken = createRunToken(this.keys, agent.id, claims.runId)
     this.log(`Run ${claims.runId} handshaked from ${body.hostname ?? "an unnamed host"} (agent ${agent.label})`)
 
+    const clientProtocolVersion =
+      typeof (body.run_env as any)?.protocol_version === "number" ? (body.run_env as any).protocol_version : 1
+    const negotiatedVersion = Math.min(clientProtocolVersion, PROTOCOL_VERSION)
+
     const response: HandshakeResponse = {
       run_id: claims.runId,
       run_token: runToken.token,
@@ -143,7 +169,7 @@ export class RuntimeApi {
       permission_request_timeout_seconds: agent.permission_request_timeout_seconds,
       // The only time the key leaves this server, decrypted, to the run it belongs to.
       llm_api_key: agent.llm_api_key_sealed ? unseal(this.keys, agent.llm_api_key_sealed) : null,
-      protocol_version: PROTOCOL_VERSION,
+      protocol_version: negotiatedVersion,
     }
     return json(response)
   }
@@ -184,12 +210,51 @@ export class RuntimeApi {
     const claims = this.runClaims(req)
     const body = await readBody(req, EventBody, MAX_RUNNER_BODY_BYTES)
     const run = this.activeRun(claims)
-    this.store.addEvent(run.id, body.event_type as any, body.payload, {
-      tokensIn: body.tokens_in,
-      tokensOut: body.tokens_out,
-      costUsd: body.cost_usd ?? null,
-    })
-    return json({ run_id: run.id, status: run.status })
+
+    if (body.event_id) {
+      const existing = this.store.getEvent(body.event_id)
+      if (existing) {
+        if (existing.run_id !== run.id) {
+          throw new HttpError(409, `Event ID ${body.event_id} already exists on a different run`)
+        }
+        const existingPayload = parseJson<Record<string, unknown>>(existing.payload, {})
+        const payloadMatches = isDeepEqual(existingPayload, body.payload)
+        const typeMatches = existing.event_type === body.event_type
+        const tokensInMatches = existing.tokens_in === body.tokens_in
+        const tokensOutMatches = existing.tokens_out === body.tokens_out
+        const costMatches =
+          (existing.cost_usd === null && (body.cost_usd === null || body.cost_usd === undefined)) ||
+          (existing.cost_usd !== null &&
+            body.cost_usd !== null &&
+            body.cost_usd !== undefined &&
+            Math.abs(existing.cost_usd - body.cost_usd) < 1e-6)
+
+        if (payloadMatches && typeMatches && tokensInMatches && tokensOutMatches && costMatches) {
+          return json({
+            run_id: run.id,
+            status: run.status,
+            event_id: existing.id,
+            acknowledged: true,
+            duplicate: true,
+          })
+        }
+
+        throw new HttpError(409, `Event ID ${body.event_id} already exists with a different payload`)
+      }
+    }
+
+    const created = this.store.addEvent(
+      run.id,
+      body.event_type as any,
+      body.payload,
+      {
+        tokensIn: body.tokens_in,
+        tokensOut: body.tokens_out,
+        costUsd: body.cost_usd ?? null,
+      },
+      body.event_id,
+    )
+    return json({ run_id: run.id, status: run.status, event_id: created.id, acknowledged: true })
   }
 
   finish = async (req: Request): Promise<Response> => {

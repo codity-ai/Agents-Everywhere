@@ -42,7 +42,7 @@ Reply:
 | `interactive` | Hand the terminal to the engine's TUI instead of running headless. |
 | `permission_mode` | `strict` refuses anything outside the rules; `request` asks a person. |
 | `permission_request_timeout_seconds` | How long a request waits before it counts as refused. |
-| `protocol_version` | `1`. |
+| `protocol_version` | `1` or `2` (negotiated with the runner). |
 
 `401` for a missing or invalid token, `409` when the run was already claimed or the agent was revoked.
 
@@ -69,8 +69,13 @@ A malformed cursor or acknowledgement id is ignored, never an error, because the
 ## `POST /agents/runtime/events`
 
 ```json
-{ "event_type": "step", "payload": { "kind": "tool", "message": "Read ./logs/app.log" }, "tokens_in": 1200, "tokens_out": 80, "cost_usd": 0.0031 }
+{ "event_id": "c1f7b0a2-...", "event_type": "step", "payload": { "kind": "tool", "message": "Read ./logs/app.log" }, "tokens_in": 1200, "tokens_out": 80, "cost_usd": 0.0031 }
 ```
+
+`event_id` is an optional runner-generated unique ID (UUIDv4) persisted in the runner's on-disk outbox before sending.
+When provided, the control plane ensures idempotent processing: replaying an event with the same ID, payload and usage after a dropped acknowledgement returns HTTP 200 without creating duplicate transcript entries or double-counting usage.
+Reusing an existing `event_id` with a different payload, event type or usage is rejected with HTTP 409.
+Posting events to a run that has already finished or ended is rejected with HTTP 409.
 
 `event_type` is one of `heartbeat`, `step`, `summary`, `error`, `permission_denied`, `permission_request`. A runner cannot post `user_message`: that type is reserved for what a person sends. Payloads say what the agent did, never what it saw: file contents and command output stay on the machine.
 
