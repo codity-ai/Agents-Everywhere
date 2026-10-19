@@ -88,7 +88,22 @@ export class DurableOutbox {
         const raw = fs.readFileSync(this.filePath, "utf8")
         const parsed: OutboxData = JSON.parse(raw)
         if (Array.isArray(parsed.events)) {
-          this.queue = parsed.events
+          this.queue = parsed.events.filter((e) => {
+            if (
+              e &&
+              typeof e === "object" &&
+              typeof e.id === "string" &&
+              typeof e.seq === "number" &&
+              typeof e.eventType === "string" &&
+              typeof e.attempts === "number" &&
+              e.payload &&
+              typeof e.payload === "object"
+            ) {
+              return true
+            }
+            this.logFn(`Discarding malformed outbox entry: ${JSON.stringify(e)}`)
+            return false
+          })
           this.seqCounter = this.queue.reduce((max, e) => Math.max(max, e.seq || 0), 0)
           this.logFn(`Loaded ${this.queue.length} pending event(s) from outbox at ${this.filePath}`)
         }
@@ -237,10 +252,13 @@ export class DurableOutbox {
 
         if (res.status === 409) {
           const detail = typeof res.data === "object" && res.data ? String((res.data as any).detail || "") : ""
-          if (detail.includes("already") || detail.includes("terminal") || detail.includes("ended")) {
+          // The control plane says "Run is already <terminal status>" when the run has ended.
+          // A payload conflict says "Event ID ... already exists with a different payload".
+          // Only stop for the former; discard the individual event for the latter.
+          const isRunTerminal = /^Run is already\b/i.test(detail)
+          if (isRunTerminal || detail.includes("terminal") || detail.includes("ended")) {
             this.logFn(`Run is terminal on control plane (HTTP 409: ${detail}); stopping outbox delivery.`)
             this.stop()
-            this.clear()
             break
           }
           // Payload conflict: duplicate event id with mismatched payload
@@ -264,10 +282,12 @@ export class DurableOutbox {
         this.logFn(`Event delivery failed (HTTP ${res.status}); retrying in ${delay}ms (attempt ${current.attempts})`)
         await this.wait(delay)
       } catch (err: any) {
-        current.attempts++
+        if (current && typeof current.attempts === "number") {
+          current.attempts++
+        }
         const delay = Math.round(this.backoffDelay * (1.2 + Math.random() * 0.4))
         this.backoffDelay = Math.min(MAX_BACKOFF_MS, this.backoffDelay * 2)
-        this.logFn(`Network error delivering event: ${err?.message || err}; retrying in ${delay}ms (attempt ${current.attempts})`)
+        this.logFn(`Network error delivering event: ${err?.message || err}; retrying in ${delay}ms (attempt ${current?.attempts ?? "?"})`)
         await this.wait(delay)
       }
     }

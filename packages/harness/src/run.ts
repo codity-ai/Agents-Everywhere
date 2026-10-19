@@ -135,7 +135,6 @@ class Run {
   private stopAgent(reason: string) {
     if (this.killed) return
     this.killed = true
-    this.outbox.stop()
     log(reason)
     if (this.activeChild) this.activeChild.kill("SIGTERM")
   }
@@ -216,9 +215,14 @@ class Run {
     if (this.activeChild) this.activeChild.kill("SIGTERM")
     // process.exit skips the run's finally, so the config is removed here too.
     this.removeEngineConfig()
-    await this.outbox.flush(3_000)
+    const flushed = await this.outbox.flush(3_000)
     await this.finish("killed", `stopped by ${signal}`)
-    this.outbox.cleanup()
+    if (flushed) {
+      this.outbox.cleanup()
+    } else {
+      this.outbox.stop()
+      log(`Outbox has ${this.outbox.size()} unflushed event(s); use --recover-outbox ${this.fileId} to retry.`)
+    }
     process.exit(1)
   }
 
@@ -426,9 +430,14 @@ class Run {
     clearTimeout(this.heartbeatTimer)
 
     if (this.killed) {
-      await this.outbox.flush(5_000)
+      const flushed = await this.outbox.flush(5_000)
       await this.finish("killed", "stopped by operator")
-      this.outbox.cleanup()
+      if (flushed) {
+        this.outbox.cleanup()
+      } else {
+        this.outbox.stop()
+        log(`Outbox has ${this.outbox.size()} unflushed event(s); use --recover-outbox ${this.fileId} to retry.`)
+      }
       log("Run stopped.")
       return 0
     }
