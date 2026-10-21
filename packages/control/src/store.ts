@@ -5,17 +5,54 @@
  */
 import type { Database } from "bun:sqlite"
 import crypto from "crypto"
-import type {
-  EventType,
-  OsShell,
-  PermissionModeValue,
-  RequestStatus,
-  RunStatus,
-  SecretProvider,
+import {
+  LIVE_RUN_STATUSES,
+  RUN_TRANSITIONS,
+  TERMINAL_RUN_STATUSES,
+  type EventType,
+  type OsShell,
+  type PermissionModeValue,
+  type RequestStatus,
+  type RunStatus,
+  type SecretProvider,
 } from "@agents-everywhere/harness/protocol"
 import { nowIso } from "./db"
 import type { Rule } from "./policy"
 import { configuredRules, EMPTY_GLOBAL_YAML, parseGlobalYaml } from "./configuration"
+import { HttpError, parseJson } from "./http"
+
+export class EventConflictError extends HttpError {
+  constructor(message = "Conflicting payload for existing event ID") {
+    super(409, message)
+    this.name = "EventConflictError"
+  }
+}
+
+export const MAX_PAYLOAD_EQUIVALENCE_DEPTH = 32
+
+export function arePayloadsEquivalent(a: unknown, b: unknown, depth = 0): boolean {
+  if (depth > MAX_PAYLOAD_EQUIVALENCE_DEPTH) return false
+  if (a === b) return true
+  if (a === null || b === null || typeof a !== "object" || typeof b !== "object") return false
+  if (Array.isArray(a) !== Array.isArray(b)) return false
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length) return false
+    for (let i = 0; i < a.length; i++) {
+      if (!arePayloadsEquivalent(a[i], b[i], depth + 1)) return false
+    }
+    return true
+  }
+  const objA = a as Record<string, unknown>
+  const objB = b as Record<string, unknown>
+  const keysA = Object.keys(objA)
+  const keysB = Object.keys(objB)
+  if (keysA.length !== keysB.length) return false
+  for (const key of keysA) {
+    if (!Object.prototype.hasOwnProperty.call(objB, key)) return false
+    if (!arePayloadsEquivalent(objA[key], objB[key], depth + 1)) return false
+  }
+  return true
+}
 
 export interface AgentRow {
   id: string
@@ -32,6 +69,7 @@ export interface AgentRow {
   declared_env_vars: string
   rejection_yaml: string
   use_global_config: number
+  spend_limit_usd: number | null
   status: "draft" | "active" | "revoked"
   created_at: string
   updated_at: string
@@ -58,7 +96,9 @@ export interface RunRow {
   status: RunStatus
   hostname: string | null
   run_env: string
+  spend_limit_usd: number | null
   kill_requested_at: string | null
+  kill_reason: string | null
   started_at: string | null
   ended_at: string | null
   last_heartbeat_at: string | null
@@ -69,6 +109,7 @@ export interface EventRow {
   seq: number
   id: string
   run_id: string
+  client_event_id: string | null
   event_type: EventType
   payload: string
   tokens_in: number
@@ -131,6 +172,7 @@ export interface NewAgent {
   declared_env_vars: string[]
   rejection_yaml?: string
   use_global_config?: boolean
+  spend_limit_usd?: number | null
 }
 
 export type AgentPatch = Partial<Omit<NewAgent, "os_shell">> & { clear_llm_api_key?: boolean }
@@ -182,8 +224,8 @@ export class Store {
       this.db
         .query(
           `INSERT INTO agents (id, label, os_shell, location_label, task, model_provider, model_name, llm_api_key_sealed,
-             interactive, permission_mode, permission_request_timeout_seconds, declared_env_vars, rejection_yaml, use_global_config, status, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)`,
+             interactive, permission_mode, permission_request_timeout_seconds, declared_env_vars, rejection_yaml, use_global_config, spend_limit_usd, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)`,
         )
         .run(
           id,
@@ -200,6 +242,7 @@ export class Store {
           JSON.stringify(agent.declared_env_vars),
           agent.rejection_yaml ?? "",
           agent.use_global_config ? 1 : 0,
+          agent.spend_limit_usd ?? null,
           now,
           now,
         )
@@ -282,6 +325,7 @@ export class Store {
     if (patch.declared_env_vars !== undefined) columns.declared_env_vars = JSON.stringify(patch.declared_env_vars)
     if (patch.rejection_yaml !== undefined) columns.rejection_yaml = patch.rejection_yaml
     if (patch.use_global_config !== undefined) columns.use_global_config = patch.use_global_config ? 1 : 0
+    if (patch.spend_limit_usd !== undefined) columns.spend_limit_usd = patch.spend_limit_usd
     const names = Object.keys(columns)
     if (names.length === 0) return
     // Column names come from the fixed list above, never from the request.
@@ -365,10 +409,32 @@ export class Store {
 
   createPendingRun(agentId: string): string {
     const id = uuid()
+    const agent = this.getAgent(agentId)
     this.db
-      .query("INSERT INTO runs (id, agent_id, status, created_at) VALUES (?, ?, 'pending', ?)")
-      .run(id, agentId, nowIso())
+      .query("INSERT INTO runs (id, agent_id, status, spend_limit_usd, created_at) VALUES (?, ?, 'pending', ?, ?)")
+      .run(id, agentId, agent?.spend_limit_usd ?? null, nowIso())
     return id
+  }
+
+  runUsage(runId: string): {
+    total_cost: number
+    unpriced_count: number
+  } {
+    const row = this.db
+      .query<
+        { total_cost: number; unpriced_count: number },
+        [string]
+      >(
+        `SELECT
+           COALESCE(SUM(MAX(0, cost_usd)), 0) AS total_cost,
+           COUNT(CASE WHEN cost_usd IS NULL AND (tokens_in > 0 OR tokens_out > 0) THEN 1 END) AS unpriced_count
+         FROM events WHERE run_id = ?`,
+      )
+      .get(runId) ?? { total_cost: 0, unpriced_count: 0 }
+    return {
+      total_cost: Math.round(row.total_cost * 1e6) / 1e6,
+      unpriced_count: row.unpriced_count,
+    }
   }
 
   /** The handshake's claim: only a run still pending can be taken, so a replayed
@@ -449,12 +515,76 @@ export class Store {
     return status
   }
 
-  endRun(runId: string, status: RunStatus) {
-    this.db.query("UPDATE runs SET status = ?, ended_at = ? WHERE id = ?").run(status, nowIso(), runId)
+  endRun(runId: string, status: RunStatus): boolean {
+    return (
+      this.db
+        .query(
+          `UPDATE runs SET status = ?, ended_at = ?
+           WHERE id = ? AND status IN ('pending', 'handshaked', 'running')`,
+        )
+        .run(status, nowIso(), runId).changes === 1
+    )
+  }
+
+  finishRun(
+    runId: string,
+    targetStatus: RunStatus,
+    message?: string,
+  ):
+    | { ok: true; status: RunStatus; alreadyTerminal: boolean; transitioned: boolean }
+    | { ok: false; error: "invalid_transition"; message: string } {
+    return this.transaction(() => {
+      const run = this.getRun(runId)
+      if (!run) {
+        throw new Error("Agent run not found")
+      }
+
+      // Repeated finish requests are safe and idempotent
+      if (TERMINAL_RUN_STATUSES.includes(run.status)) {
+        return { ok: true, status: run.status, alreadyTerminal: true, transitioned: false }
+      }
+
+      if (!RUN_TRANSITIONS[run.status].includes(targetStatus)) {
+        return {
+          ok: false,
+          error: "invalid_transition",
+          message: `Cannot finish as ${targetStatus} from ${run.status}`,
+        }
+      }
+
+      let finalStatus: RunStatus = targetStatus
+      if (run.kill_reason === "budget_exceeded") {
+        finalStatus = "budget_exceeded"
+      } else if (run.kill_reason === "unpriced_usage_halt") {
+        finalStatus = "unpriced_usage_halt"
+      } else if (run.kill_reason === "operator_kill" && targetStatus !== "killed") {
+        finalStatus = "killed"
+      }
+
+      const changed =
+        this.db
+          .query(
+            `UPDATE runs SET status = ?, ended_at = ?
+             WHERE id = ? AND status IN ('pending', 'handshaked', 'running')`,
+          )
+          .run(finalStatus, nowIso(), runId).changes === 1
+
+      if (!changed) {
+        const refreshed = this.getRun(runId)!
+        return { ok: true, status: refreshed.status, alreadyTerminal: true, transitioned: false }
+      }
+
+      if (message) {
+        const benign = finalStatus === "succeeded" || finalStatus === "idle_timeout"
+        this.addEvent(run.id, benign ? "summary" : "error", { message })
+      }
+
+      return { ok: true, status: finalStatus, alreadyTerminal: false, transitioned: true }
+    })
   }
 
   /** Stops one run. A run nobody installed yet is removed, so its command stops working. */
-  requestKill(runId: string): "signaled" | "removed" | "already_ended" {
+  requestKill(runId: string, reason: string = "operator_kill"): "signaled" | "removed" | "already_ended" {
     const run = this.getRun(runId)
     if (!run) return "already_ended"
     if (run.status === "pending") {
@@ -463,9 +593,16 @@ export class Store {
     }
     const changed = this.db
       .query(
-        "UPDATE runs SET kill_requested_at = COALESCE(kill_requested_at, ?) WHERE id = ? AND status IN ('handshaked', 'running')",
+        `UPDATE runs SET
+           kill_requested_at = COALESCE(kill_requested_at, ?),
+           kill_reason = CASE
+             WHEN kill_reason = 'operator_kill' THEN 'operator_kill'
+             WHEN ? = 'operator_kill' THEN 'operator_kill'
+             ELSE COALESCE(kill_reason, ?)
+           END
+         WHERE id = ? AND status IN ('handshaked', 'running')`,
       )
-      .run(nowIso(), runId).changes
+      .run(nowIso(), reason, reason, runId).changes
     return changed === 1 ? "signaled" : "already_ended"
   }
 
@@ -476,24 +613,127 @@ export class Store {
     type: EventType,
     payload: unknown,
     usage: { tokensIn?: number; tokensOut?: number; costUsd?: number | null } = {},
-  ) {
+    clientEventId?: string | null,
+  ): EventRow & { inserted: boolean } {
     const id = uuid()
+    const sanitizedCost =
+      typeof usage.costUsd === "number" && Number.isFinite(usage.costUsd) ? Math.max(0, usage.costUsd) : null
+    const sanitizeTokens = (val: unknown): number =>
+      typeof val === "number" && Number.isFinite(val) ? Math.max(0, Math.floor(val)) : 0
+    const tokensIn = sanitizeTokens(usage.tokensIn)
+    const tokensOut = sanitizeTokens(usage.tokensOut)
+    const now = nowIso()
+
+    if (clientEventId) {
+      const res = this.db
+        .query(
+          `INSERT INTO events (id, run_id, client_event_id, event_type, payload, tokens_in, tokens_out, cost_usd, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (run_id, client_event_id) DO NOTHING`,
+        )
+        .run(
+          id,
+          runId,
+          clientEventId,
+          type,
+          JSON.stringify(payload ?? {}),
+          tokensIn,
+          tokensOut,
+          sanitizedCost,
+          now,
+        )
+      if (res.changes === 0) {
+        const existing = this.db
+          .query<EventRow, [string, string]>("SELECT * FROM events WHERE run_id = ? AND client_event_id = ?")
+          .get(runId, clientEventId)!
+
+        const existingPayload = parseJson(existing.payload, {})
+        const incomingPayload = (payload ?? {}) as Record<string, unknown>
+
+        const typeMatches = existing.event_type === type
+        const tokensInMatches = existing.tokens_in === tokensIn
+        const tokensOutMatches = existing.tokens_out === tokensOut
+        const costMatches =
+          (existing.cost_usd === null && sanitizedCost === null) ||
+          (existing.cost_usd !== null &&
+            sanitizedCost !== null &&
+            Math.abs(existing.cost_usd - sanitizedCost) < 1e-6)
+        const payloadMatches = arePayloadsEquivalent(existingPayload, incomingPayload)
+
+        if (!typeMatches || !tokensInMatches || !tokensOutMatches || !costMatches || !payloadMatches) {
+          throw new EventConflictError(
+            `Conflicting event payload for existing event ID "${clientEventId}": ` +
+              `type=${existing.event_type}/${type}, in=${existing.tokens_in}/${tokensIn}, ` +
+              `out=${existing.tokens_out}/${tokensOut}, cost=${existing.cost_usd}/${sanitizedCost}`,
+          )
+        }
+
+        return Object.assign(existing, { inserted: false })
+      }
+      const created = this.db.query<EventRow, [string]>("SELECT * FROM events WHERE id = ?").get(id)!
+      return Object.assign(created, { inserted: true })
+    }
+
     this.db
       .query(
-        `INSERT INTO events (id, run_id, event_type, payload, tokens_in, tokens_out, cost_usd, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO events (id, run_id, client_event_id, event_type, payload, tokens_in, tokens_out, cost_usd, created_at)
+         VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
         runId,
         type,
         JSON.stringify(payload ?? {}),
-        usage.tokensIn ?? 0,
-        usage.tokensOut ?? 0,
-        usage.costUsd ?? null,
-        nowIso(),
+        tokensIn,
+        tokensOut,
+        sanitizedCost,
+        now,
       )
-    return this.db.query<EventRow, [string]>("SELECT * FROM events WHERE id = ?").get(id)!
+    const created = this.db.query<EventRow, [string]>("SELECT * FROM events WHERE id = ?").get(id)!
+    return Object.assign(created, { inserted: true })
+  }
+
+  recordEventAndCheckBudget(
+    runId: string,
+    type: EventType,
+    payload: unknown,
+    usage: { tokensIn?: number; tokensOut?: number; costUsd?: number | null } = {},
+    clientEventId?: string | null,
+  ): {
+    event: EventRow
+    inserted: boolean
+    run: RunRow
+    killTriggered: boolean
+    killReason: string | null
+  } {
+    return this.transaction(() => {
+      const added = this.addEvent(runId, type, payload, usage, clientEventId)
+      let run = this.getRun(runId)!
+      let killTriggered = false
+      let killReason: string | null = null
+
+      if (added.inserted && run.spend_limit_usd !== null && run.spend_limit_usd !== undefined) {
+        const currentUsage = this.runUsage(runId)
+        if (currentUsage.unpriced_count > 0) {
+          killReason = "unpriced_usage_halt"
+          this.requestKill(runId, killReason)
+          killTriggered = true
+        } else if (currentUsage.total_cost >= run.spend_limit_usd) {
+          killReason = "budget_exceeded"
+          this.requestKill(runId, killReason)
+          killTriggered = true
+        }
+        run = this.getRun(runId)!
+      }
+
+      return {
+        event: added,
+        inserted: added.inserted,
+        run,
+        killTriggered,
+        killReason,
+      }
+    })
   }
 
   events(runId: string, afterSeq = 0, limit = 1000): EventRow[] {
@@ -728,12 +968,36 @@ export class Store {
     let ended = 0
     for (const { id } of stale) {
       this.transaction(() => {
+        const run = this.getRun(id)
+        if (!run || !LIVE_RUN_STATUSES.includes(run.status)) return
+
+        let terminalStatus: RunStatus = "failed"
+        let eventReason = "lost_contact"
+        let eventMessage = message
+
+        if (run.kill_reason === "operator_kill") {
+          terminalStatus = "killed"
+          eventReason = "operator_kill"
+          eventMessage = "Stopped by operator, lost contact before finish confirmation."
+        } else if (run.kill_reason === "budget_exceeded") {
+          terminalStatus = "budget_exceeded"
+          eventReason = "budget_exceeded"
+          eventMessage = "Spend limit exceeded, lost contact before finish confirmation."
+        } else if (run.kill_reason === "unpriced_usage_halt") {
+          terminalStatus = "unpriced_usage_halt"
+          eventReason = "unpriced_usage_halt"
+          eventMessage = "Unpriced usage halt, lost contact before finish confirmation."
+        }
+
         const changed = this.db
-          .query("UPDATE runs SET status = 'failed', ended_at = ? WHERE id = ? AND status IN ('handshaked', 'running')")
-          .run(nowIso(), id).changes
+          .query(
+            `UPDATE runs SET status = ?, ended_at = ?
+             WHERE id = ? AND status IN ('handshaked', 'running')`,
+          )
+          .run(terminalStatus, nowIso(), id).changes
         if (!changed) return
         ended++
-        this.addEvent(id, "error", { message, reason: "lost_contact" })
+        this.addEvent(id, "error", { message: eventMessage, reason: eventReason })
         // Nobody will apply a decision to a run that is gone.
         this.db
           .query(

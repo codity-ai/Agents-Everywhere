@@ -75,6 +75,7 @@ const AgentFields = {
   secrets: z.array(Secret).max(50).optional(),
   rejection_yaml: z.string().max(MAX_CONFIG_YAML_BYTES).optional(),
   use_global_config: z.boolean().optional(),
+  spend_limit_usd: AGENT_DEFAULT_FIELDS.spend_limit_usd,
 }
 
 const CreateAgent = z.object({
@@ -104,6 +105,7 @@ const UpdateAgent = z.object({
   secrets: AgentFields.secrets,
   rejection_yaml: AgentFields.rejection_yaml,
   use_global_config: AgentFields.use_global_config,
+  spend_limit_usd: AgentFields.spend_limit_usd,
   permissions: z.array(Permission).optional(),
   acknowledge_bash_gateways: z.boolean().default(false),
 })
@@ -157,6 +159,7 @@ function runOut(run: RunRow) {
     status: run.status,
     hostname: run.hostname,
     run_env: parseJson(run.run_env, {}),
+    spend_limit_usd: run.spend_limit_usd,
     kill_requested: run.kill_requested_at !== null,
     started_at: run.started_at,
     ended_at: run.ended_at,
@@ -204,6 +207,7 @@ function agentOut(agent: AgentRow) {
     task: agent.task,
     model_provider: agent.model_provider,
     model_name: agent.model_name,
+    spend_limit_usd: agent.spend_limit_usd,
     // Never the key itself: it is sealed at rest and leaves only in a handshake.
     has_llm_api_key: agent.llm_api_key_sealed !== null,
     interactive: agent.interactive === 1,
@@ -337,6 +341,7 @@ export class AdminApi {
         declared_env_vars: body.declared_env_vars ?? defaults.declared_env_vars ?? [],
         rejection_yaml: body.rejection_yaml ?? "",
         use_global_config: body.use_global_config ?? false,
+        spend_limit_usd: body.spend_limit_usd !== undefined ? body.spend_limit_usd : (defaults.spend_limit_usd ?? null),
       },
       dedupeRules(requested),
       toSecretInputs(body.secrets),
@@ -375,6 +380,7 @@ export class AdminApi {
         declared_env_vars: body.declared_env_vars,
         rejection_yaml: body.rejection_yaml,
         use_global_config: body.use_global_config,
+        spend_limit_usd: body.spend_limit_usd,
       })
       if (body.secrets) this.store.replaceSecrets(id, toSecretInputs(body.secrets))
       if (body.permissions) this.store.replaceRules(id, dedupeRules(rules))

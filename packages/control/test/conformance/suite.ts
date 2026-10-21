@@ -262,6 +262,7 @@ export const CHECKS: Check[] = [
     async run(a) {
       const { runToken } = await startRun(a)
       const step = await post(a, "/agents/runtime/events", runToken, {
+        id: "step_usage_1",
         event_type: "step",
         payload: { kind: "usage", message: "Step finished" },
         tokens_in: 10,

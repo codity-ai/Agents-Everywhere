@@ -38,8 +38,9 @@ export class RunnerClient {
     return request("POST", `${this.apiUrl}/agents/runtime/heartbeat`, body, this.headers())
   }
 
-  postEvent(eventType: EventType, payload: Record<string, unknown>, usage: Usage = {}) {
+  postEvent(eventType: EventType, payload: Record<string, unknown>, usage: Usage = {}, eventId?: string) {
     const body: EventRequest = {
+      ...(eventId !== undefined ? { event_id: eventId } : {}),
       event_type: eventType,
       payload,
       tokens_in: usage.tokensIn || 0,

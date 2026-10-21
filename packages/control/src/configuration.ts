@@ -24,6 +24,7 @@ export const AGENT_DEFAULT_FIELDS = {
   permission_mode: z.enum(PERMISSION_MODES),
   permission_request_timeout_seconds: z.number().int().min(30).max(86_400),
   declared_env_vars: z.array(z.string().regex(ENV_VAR_NAME, "must be an environment variable name")).max(100),
+  spend_limit_usd: z.number().positive("must be greater than 0").finite().max(100_000).nullable().optional(),
 }
 
 export const Permission = z

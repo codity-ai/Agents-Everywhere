@@ -60,6 +60,7 @@ export interface Run {
   status: string
   hostname: string | null
   run_env: Record<string, unknown>
+  spend_limit_usd?: number | null
   kill_requested: boolean
   started_at: string | null
   ended_at: string | null
@@ -86,6 +87,7 @@ export interface AgentSummary {
   latest_run_last_heartbeat_at: string | null
   total_cost_usd: number
   pending_permission_requests: number
+  spend_limit_usd?: number | null
 }
 
 export type FleetRange = "24h" | "7d" | "30d"

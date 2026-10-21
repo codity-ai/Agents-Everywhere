@@ -455,6 +455,27 @@ export async function renderForm(main: HTMLElement, agentId?: string) {
         : "Runs unattended and reports back here. Nothing to watch.",
     )
 
+  // ── Spending limit ──
+  const spendLimit = h("input", {
+    id: "agent-spend-limit",
+    class: "input input-mono input-narrow",
+    type: "number",
+    min: "0.01",
+    max: "100000",
+    step: "any",
+    placeholder: "No limit",
+    value: agent?.spend_limit_usd != null ? String(agent.spend_limit_usd) : "",
+    "aria-label": "Spending limit in USD",
+  })
+  const validateSpendLimit = () => {
+    const raw = spendLimit.value.trim()
+    if (!raw) return null
+    const val = Number(raw)
+    if (!Number.isFinite(val) || val <= 0) return "Spending limit must be greater than $0."
+    if (val > 100_000) return "Spending limit cannot exceed $100,000."
+    return null
+  }
+
   // ── Footer ──
   const missing = h("span", { class: "hint" })
   const submit = button(editing ? "Save changes" : "Deploy agent", { type: "submit", variant: "primary", icon: editing ? "check" : "send" })
@@ -464,15 +485,23 @@ export async function renderForm(main: HTMLElement, agentId?: string) {
     if (!task.value.trim()) return "Describe the task to deploy it."
     if (!modelName) return "Choose a model to deploy it."
     if (!editing && !key.value) return "Add the provider's API key to deploy it."
+    const limitError = validateSpendLimit()
+    if (limitError) return limitError
     return editing ? "Changes apply from the next run." : "Ready. You get an install command next."
   }
   const refreshFooter = () => {
     const note = whatsMissing()
     replace(missing, note)
-    submit.disabled = note.endsWith("to deploy it.")
+    submit.disabled = note.endsWith("to deploy it.") || note.startsWith("Spending limit")
   }
-  for (const el of [name, task, key]) el.addEventListener("input", refreshFooter)
-  for (const [element, field] of [[task, "task"], [where, "location_label"], [envVars, "declared_env_vars"], [timeout, "permission_request_timeout_seconds"]] as const) {
+  for (const el of [name, task, key, spendLimit]) el.addEventListener("input", refreshFooter)
+  for (const [element, field] of [
+    [task, "task"],
+    [where, "location_label"],
+    [envVars, "declared_env_vars"],
+    [timeout, "permission_request_timeout_seconds"],
+    [spendLimit, "spend_limit_usd"],
+  ] as const) {
     element.addEventListener("input", () => dirtyDefaults.add(field))
   }
   modelTyped.addEventListener("input", () => { dirtyDefaults.add("model_provider"); dirtyDefaults.add("model_name") })
@@ -487,6 +516,9 @@ export async function renderForm(main: HTMLElement, agentId?: string) {
     if (!dirtyDefaults.has("permission_mode")) mode = defaults.permission_mode ?? "strict"
     if (!dirtyDefaults.has("permission_request_timeout_seconds")) timeout.value = String((defaults.permission_request_timeout_seconds ?? 900) / 60)
     if (!dirtyDefaults.has("declared_env_vars")) envVars.value = (defaults.declared_env_vars ?? []).join(", ")
+    if (!dirtyDefaults.has("spend_limit_usd")) {
+      spendLimit.value = defaults.spend_limit_usd != null ? String(defaults.spend_limit_usd) : ""
+    }
     if (!dirtyDefaults.has("model_provider")) {
       modelProvider = defaults.model_provider ?? "anthropic"
       providerSelect.setOptions(MODEL_PROVIDERS.map((p) => ({ value: p.id, label: p.label })), modelProvider)
@@ -541,6 +573,16 @@ export async function renderForm(main: HTMLElement, agentId?: string) {
       modelNote,
       key,
       editing && agent.has_llm_api_key ? h("label", { class: "check" }, clearKey, "Remove the stored key") : null,
+    ),
+    row(
+      "Spending limit",
+      "Optional guardrail in USD per run. Reaching the threshold stops further provider turns.",
+      h("div", { class: "inline" }, h("span", { class: "micro-label" }, "$"), spendLimit),
+      h(
+        "p",
+        { class: "hint" },
+        "Spending is checked at provider-step boundaries. An already-running provider step may incur additional cost before termination takes effect, so actual spend can exceed this threshold.",
+      ),
     ),
     row(
       "Behaviour",
@@ -607,6 +649,19 @@ export async function renderForm(main: HTMLElement, agentId?: string) {
     if (submit.disabled) return
     errorRow.hidden = true
     errorBox.hidden = true
+    const rawLimit = spendLimit.value.trim()
+    if (rawLimit) {
+      const parsedLimit = Number(rawLimit)
+      if (!Number.isFinite(parsedLimit) || parsedLimit <= 0 || parsedLimit > 100_000) {
+        errorRow.hidden = false
+        errorBox.hidden = false
+        replace(errorBox, "Spending limit must be a positive number up to $100,000.")
+        errorRow.scrollIntoView({ block: "center" })
+        refreshFooter()
+        return
+      }
+    }
+    const spendLimitUsd = rawLimit ? Number(rawLimit) : null
     const secretsOut: Secret[] = secrets.flatMap((s) => {
       const mappings = s.mappings.filter((m) => m.envVar.trim())
       if (!s.reference.trim() || mappings.length === 0) return []
@@ -633,6 +688,7 @@ export async function renderForm(main: HTMLElement, agentId?: string) {
         .split(",")
         .map((v) => v.trim())
         .filter(Boolean),
+      spend_limit_usd: spendLimitUsd,
       secrets: secretsOut,
       rejection_yaml: rejection.value,
       use_global_config: useGlobal.checked,

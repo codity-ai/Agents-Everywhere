@@ -24,23 +24,51 @@ export const RUN_STATUSES = [
   "failed",
   "killed",
   "idle_timeout",
+  "budget_exceeded",
+  "unpriced_usage_halt",
 ] as const
 export type RunStatus = (typeof RUN_STATUSES)[number]
 
-export const TERMINAL_RUN_STATUSES: readonly RunStatus[] = ["succeeded", "failed", "killed", "idle_timeout"]
+export const TERMINAL_RUN_STATUSES: readonly RunStatus[] = [
+  "succeeded",
+  "failed",
+  "killed",
+  "idle_timeout",
+  "budget_exceeded",
+  "unpriced_usage_halt",
+]
 export const LIVE_RUN_STATUSES: readonly RunStatus[] = ["handshaked", "running"]
 
 /** Which terminal status a run in each state may be finished with. */
 export const RUN_TRANSITIONS: Record<RunStatus, readonly RunStatus[]> = {
   pending: ["handshaked", "killed", "failed"],
   // A run can finish before its first heartbeat moves it to running.
-  handshaked: ["running", "succeeded", "killed", "failed", "idle_timeout"],
-  running: ["succeeded", "failed", "killed", "idle_timeout"],
+  handshaked: [
+    "running",
+    "succeeded",
+    "killed",
+    "failed",
+    "idle_timeout",
+    "budget_exceeded",
+    "unpriced_usage_halt",
+  ],
+  running: [
+    "succeeded",
+    "failed",
+    "killed",
+    "idle_timeout",
+    "budget_exceeded",
+    "unpriced_usage_halt",
+  ],
   succeeded: [],
   failed: [],
   killed: [],
   idle_timeout: [],
+  budget_exceeded: [],
+  unpriced_usage_halt: [],
 }
+
+export const RUNNER_CAPABILITY_GUARDRAILS = "spending_guardrails"
 
 export const EVENT_TYPES = [
   "heartbeat",
@@ -113,6 +141,7 @@ export interface HandshakeResponse {
   permission_request_timeout_seconds?: number
   /** The only time the LLM key leaves the control plane. */
   llm_api_key?: string | null
+  spend_limit_usd?: number | null
   protocol_version?: number
   [extension: string]: unknown
 }
@@ -139,6 +168,7 @@ export interface PermissionDecision {
 
 export interface HeartbeatResponse {
   kill: boolean
+  kill_reason?: string | null
   status: RunStatus
   /** A replacement run token, when the current one is close to expiring. */
   run_token?: string | null
@@ -148,6 +178,8 @@ export interface HeartbeatResponse {
 }
 
 export interface EventRequest {
+  id?: string
+  event_id?: string
   event_type: EventType
   payload: Record<string, unknown>
   tokens_in: number
@@ -155,7 +187,13 @@ export interface EventRequest {
   cost_usd: number | null
 }
 
-export type FinishStatus = "succeeded" | "failed" | "killed" | "idle_timeout"
+export type FinishStatus =
+  | "succeeded"
+  | "failed"
+  | "killed"
+  | "idle_timeout"
+  | "budget_exceeded"
+  | "unpriced_usage_halt"
 
 export interface PermissionRequestBody {
   engine_request_id: string

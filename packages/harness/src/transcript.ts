@@ -209,10 +209,12 @@ export function createTranscript(cwd: string, options: { prompts?: boolean }) {
  * caching almost the whole prompt is a cache read.
  */
 export function tokenCounts(tokens: any): { in: number; out: number } {
+  const sanitize = (val: unknown): number =>
+    typeof val === "number" && Number.isFinite(val) ? Math.max(0, Math.floor(val)) : 0
   const t = tokens || {}
   const cache = t.cache || {}
   return {
-    in: (t.input || 0) + (cache.read || 0) + (cache.write || 0),
-    out: (t.output || 0) + (t.reasoning || 0),
+    in: sanitize(t.input) + sanitize(cache.read) + sanitize(cache.write),
+    out: sanitize(t.output) + sanitize(t.reasoning),
   }
 }

@@ -142,7 +142,8 @@ export async function renderRun(main: HTMLElement, agentId: string, runId: strin
     const live = isLive(run.status)
     // Rebuilt only when something shown changed, so a refresh never takes
     // focus off the stop button.
-    const key = `${run.status}:${run.kill_requested}:${cost.toFixed(4)}`
+    const hasBudget = typeof run.spend_limit_usd === "number" && Number.isFinite(run.spend_limit_usd)
+    const key = `${run.status}:${run.kill_requested}:${cost.toFixed(4)}:${run.spend_limit_usd ?? ""}`
     if (!replaceIfChanged(header, key, () => [])) return
     replace(
       header,
@@ -159,10 +160,31 @@ export async function renderRun(main: HTMLElement, agentId: string, runId: strin
         h("div", { class: "inline" }, exportButton, exportNdjson, live && !run.kill_requested ? stop : null),
       ),
     )
+    const observedCost = Math.max(0, cost || 0)
+    let spendNode: HTMLElement | null = null
+    if (hasBudget) {
+      spendNode = h(
+        "span",
+        {
+          class: "hint",
+          title:
+            "Spending is checked at provider-step boundaries. An already-running provider step may incur additional cost before termination takes effect, so actual spend can exceed this threshold.",
+        },
+        h("span", { class: "numeral" }, `${money(observedCost)} / ${money(run.spend_limit_usd!)}`),
+        live ? " so far" : " in total",
+      )
+    } else if (cost > 0) {
+      spendNode = h(
+        "span",
+        { class: "hint" },
+        h("span", { class: "numeral" }, money(cost)),
+        live ? " so far" : " in total",
+      )
+    }
     replace(
       statusLine,
       run.kill_requested && live ? h("span", { class: "status", "data-tone": "warning" }, "Stopping") : runStatus(run.status),
-      cost > 0 ? h("span", { class: "hint" }, h("span", { class: "numeral" }, money(cost)), live ? " so far" : " in total") : null,
+      spendNode,
       run.run_env && run.run_env.platform ? h("span", { class: "tag" }, String(run.run_env.platform)) : null,
     )
   }

@@ -26,6 +26,7 @@ import { buildAgentConfig, detectWorktree, toConfigPatterns } from "./permission
 import { runPreflight } from "./preflight"
 import {
   PROTOCOL_VERSION,
+  RUNNER_CAPABILITY_GUARDRAILS,
   type EventType,
   type FinishStatus,
   type HandshakeResponse,
@@ -33,6 +34,8 @@ import {
   type Usage,
 } from "./protocol"
 import { resolveSecretEnvVars } from "./secrets"
+import { SpendingTracker, type BudgetHaltReason } from "./spending"
+import { terminateChildProcess } from "./process"
 
 const HEARTBEAT_INTERVAL_MS = 10_000
 // While a decision is outstanding the agent is blocked, so the beat speeds up
@@ -45,7 +48,7 @@ const WAITING_HEARTBEAT_INTERVAL_MS = 2_000
 // machine started before a feature existed keeps running without it. Saying
 // what is supported lets a control plane tell a person which machine needs a
 // restart instead of guessing from a transcript.
-export const RUNNER_CAPABILITIES = ["transcript", "messages"]
+export const RUNNER_CAPABILITIES = ["transcript", "messages", RUNNER_CAPABILITY_GUARDRAILS]
 
 /** Runs the runner command line. Resolves with the process exit code. */
 export async function runRunner(argv: string[], extensions: readonly RunnerExtension[] = []): Promise<number> {
@@ -80,12 +83,13 @@ export async function runRunner(argv: string[], extensions: readonly RunnerExten
 
 class Run {
   private readonly client: RunnerClient
+  private readonly spending: SpendingTracker
   private readonly cwd = process.cwd()
   private readonly permissionMode: "strict" | "request"
   // Only used to name this run's local files; a random id keeps concurrent runs
-  // on one machine apart if a server does not return one.
   private readonly fileId: string
   private killed = false
+  private killReason: string | null = null
   private activeChild: ChildProcess | null = null
   private engineConfigPath: string | null = null
   // Decisions applied to the engine but not yet confirmed to the control plane.
@@ -103,13 +107,19 @@ class Run {
     private readonly extensions: readonly RunnerExtension[],
   ) {
     this.client = new RunnerClient(apiUrl, handshake.run_token)
+    this.spending = new SpendingTracker(handshake.spend_limit_usd)
     this.permissionMode = handshake.permission_mode === "request" ? "request" : "strict"
     this.fileId = handshake.run_id || crypto.randomBytes(8).toString("hex")
   }
 
-  private postEvent = (eventType: EventType, payload: Record<string, unknown> | string, usage?: Usage) =>
+  private postEvent = (
+    eventType: EventType,
+    payload: Record<string, unknown> | string,
+    usage?: Usage,
+    eventId?: string,
+  ) =>
     this.client
-      .postEvent(eventType, typeof payload === "string" ? { message: payload } : payload, usage)
+      .postEvent(eventType, typeof payload === "string" ? { message: payload } : payload, usage, eventId)
       .catch((err) => log(`Failed to post event: ${err}`))
 
   private async finish(status: FinishStatus, message: string) {
@@ -124,7 +134,7 @@ class Run {
     if (this.killed) return
     this.killed = true
     log(reason)
-    if (this.activeChild) this.activeChild.kill("SIGTERM")
+    if (this.activeChild) terminateChildProcess(this.activeChild)
   }
 
   private beat = async () => {
@@ -146,14 +156,21 @@ class Run {
       if (data.run_token) this.client.replaceToken(data.run_token)
       // Only clear what the server has now been told about, so an
       // acknowledgement lost with a dropped connection is simply repeated.
-      if (hb.status === 200) this.appliedRequestIds = []
-
-      if (data.kill) this.stopAgent("Kill requested from the control plane, stopping.")
+      if (data.kill) {
+        if (data.kill_reason) {
+          this.killReason = String(data.kill_reason)
+        }
+        this.stopAgent(
+          this.killReason === "budget_exceeded" || this.killReason === "unpriced_usage_halt"
+            ? `Server requested spending halt (${this.killReason}); stopping.`
+            : "Kill requested from the control plane, stopping.",
+        )
+      }
 
       // A message is acknowledged only once it has reached the agent. Stopping
       // at the first that cannot be delivered keeps it, and everything after
       // it, queued and in order for the next beat.
-      for (const m of this.killed ? [] : data.messages || []) {
+      for (const m of this.killed || this.spending.haltReason ? [] : data.messages || []) {
         const delivered = this.session ? await this.session.feedMessage(m.message) : false
         if (!delivered) break
         this.lastDeliveredMessageId = m.id
@@ -196,11 +213,12 @@ class Run {
   private onExitSignal = async (signal: string) => {
     if (this.exiting) return
     this.exiting = true
+    this.killReason = "operator_kill"
     log(`Received ${signal}, finishing run as killed.`)
     clearTimeout(this.heartbeatTimer)
     // The engine's server is spawned with piped stdio, so it outlives this
     // process unless it is told to stop.
-    if (this.activeChild) this.activeChild.kill("SIGTERM")
+    if (this.activeChild) terminateChildProcess(this.activeChild)
     // process.exit skips the run's finally, so the config is removed here too.
     this.removeEngineConfig()
     await this.finish("killed", `stopped by ${signal}`)
@@ -356,6 +374,7 @@ class Run {
         this.postEvent,
         (child) => (this.activeChild = child),
         (session) => (this.session = session),
+        this.spending,
       )
     }
 
@@ -366,14 +385,21 @@ class Run {
     if (!install.ok) return this.installFailed(install.reason)
     log("Running task for real.")
     try {
-      return await runHeadless(taskForAgent, this.cwd, handshake.model_provider, handshake.model_name, {
-        onLine: this.onLine,
-        onSpawn: (child) => (this.activeChild = child),
-        onStep: (entry, usage) => void this.postEvent("step", entry, usage),
-        onReady: (session) => (this.session = session),
-        onAsked: this.raisePermissionRequest,
-        onDenied: this.reportRefusedCall,
-      })
+      return await runHeadless(
+        taskForAgent,
+        this.cwd,
+        handshake.model_provider,
+        handshake.model_name,
+        {
+          onLine: this.onLine,
+          onSpawn: (child) => (this.activeChild = child),
+          onStep: (entry, usage, eventId) => this.postEvent("step", entry, usage, eventId),
+          onReady: (session) => (this.session = session),
+          onAsked: this.raisePermissionRequest,
+          onDenied: this.reportRefusedCall,
+        },
+        this.spending,
+      )
     } catch (err) {
       this.onLine(`Failed to run task: ${err}`)
       return { success: false, exitCode: null, error: String(err) }
@@ -410,27 +436,68 @@ class Run {
 
     clearTimeout(this.heartbeatTimer)
 
-    if (this.killed) {
-      await this.finish("killed", "stopped by operator")
-      log("Run stopped.")
-      return 0
-    }
-
-    // "Nothing happened for a minute" and "the work finished" are different
-    // outcomes, and only one of them is a success.
-    const status: FinishStatus = result.success ? (result.idle ? "idle_timeout" : "succeeded") : "failed"
-    const mode = handshake.interactive ? "Interactive session" : "Task"
-    const message = result.success
-      ? handshake.interactive
-        ? "Interactive session ended."
-        : result.idle
-          ? "Session went idle with no work in progress."
-          : "Task completed."
-      : `${mode} failed (exit code ${result.exitCode}). ${result.error || ""}`.trim()
-    const finished = await this.finish(status, message)
-    if (finished.status === 200) log(`Run ${status}.`)
-    return result.success && finished.status === 200 ? 0 : 1
+    const outcome = determineTerminalOutcome({
+      killed: this.killed,
+      killReason: this.killReason,
+      result,
+      spending: this.spending,
+      interactive: handshake.interactive,
+    })
+    const finished = await this.finish(outcome.status, outcome.message)
+    if (finished.status === 200) log(`Run ${outcome.status}.`)
+    return outcome.exitCode === 0 && finished.status === 200 ? 0 : 1
   }
+}
+
+export interface RunOutcome {
+  killed: boolean
+  killReason?: string | null
+  result: RunResult
+  spending: SpendingTracker
+  interactive?: boolean
+}
+
+export interface TerminalOutcome {
+  status: FinishStatus
+  message: string
+  exitCode: number
+}
+
+export function determineTerminalOutcome(outcome: RunOutcome): TerminalOutcome {
+  const budgetHalt =
+    outcome.result.budgetHalt ||
+    outcome.spending.haltReason ||
+    (outcome.killReason === "budget_exceeded" || outcome.killReason === "unpriced_usage_halt"
+      ? (outcome.killReason as BudgetHaltReason)
+      : null)
+
+  if (budgetHalt) {
+    const defaultMsg =
+      budgetHalt === "budget_exceeded"
+        ? "Spend limit reached."
+        : "Unpriced token usage observed under configured budget."
+    const message = outcome.result.error || outcome.spending.haltInfo?.message || defaultMsg
+    return { status: budgetHalt, message, exitCode: 1 }
+  }
+
+  if (outcome.killed) {
+    return { status: "killed", message: "stopped by operator", exitCode: 0 }
+  }
+
+  const status: FinishStatus = outcome.result.success
+    ? outcome.result.idle
+      ? "idle_timeout"
+      : "succeeded"
+    : "failed"
+  const mode = outcome.interactive ? "Interactive session" : "Task"
+  const message = outcome.result.success
+    ? outcome.interactive
+      ? "Interactive session ended."
+      : outcome.result.idle
+        ? "Session went idle with no work in progress."
+        : "Task completed."
+    : `${mode} failed (exit code ${outcome.result.exitCode}). ${outcome.result.error || ""}`.trim()
+  return { status, message, exitCode: outcome.result.success ? 0 : 1 }
 }
 
 /**

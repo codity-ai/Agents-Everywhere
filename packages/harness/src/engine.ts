@@ -193,6 +193,7 @@ export const DECISION_REPLIES: Record<PermissionDecision["decision"], EngineRepl
  * cost and tokens, that the engine's own `--format json` output uses.
  */
 export function subscribeEngineEvents(baseUrl: string, authHeader: string, onEvent: (event: any) => void) {
+  let closed = false
   const u = new URL(`${baseUrl}/event`)
   const mod = u.protocol === "https:" ? https : http
   const req = mod.request(
@@ -202,9 +203,10 @@ export function subscribeEngineEvents(baseUrl: string, authHeader: string, onEve
       let buffer = ""
       res.setEncoding("utf8")
       res.on("data", (chunk) => {
+        if (closed) return
         buffer += chunk
         let idx: number
-        while ((idx = buffer.indexOf("\n\n")) !== -1) {
+        while (!closed && (idx = buffer.indexOf("\n\n")) !== -1) {
           const frame = buffer.slice(0, idx)
           buffer = buffer.slice(idx + 2)
           const line = frame.split("\n").find((l) => l.startsWith("data:"))
@@ -223,7 +225,12 @@ export function subscribeEngineEvents(baseUrl: string, authHeader: string, onEve
        the idle grace) rather than needing its own handling here */
   })
   req.end()
-  return { close: () => req.destroy() }
+  return {
+    close: () => {
+      closed = true
+      req.destroy()
+    },
+  }
 }
 
 /**
@@ -241,4 +248,27 @@ export function getFreePort(): Promise<number> {
       srv.close(() => resolve(port))
     })
   })
+}
+
+/**
+ * Sends an abort request to stop ongoing generation in the session.
+ * Returns an explicit status and does not represent failure as success.
+ */
+export async function abortSession(
+  baseUrl: string,
+  authHeader: string,
+  sessionId: string,
+): Promise<{ ok: boolean; status?: number; error?: string }> {
+  try {
+    const res = await request(
+      "POST",
+      `${baseUrl}/session/${sessionId}/abort`,
+      undefined,
+      { Authorization: authHeader },
+      3000,
+    )
+    return { ok: res.status >= 200 && res.status < 300, status: res.status }
+  } catch (err) {
+    return { ok: false, error: String(err) }
+  }
 }

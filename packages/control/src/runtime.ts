@@ -10,7 +10,9 @@
 import { z } from "zod"
 import {
   PROTOCOL_VERSION,
+  RUN_STATUSES,
   RUN_TRANSITIONS,
+  RUNNER_CAPABILITY_GUARDRAILS,
   RUNNER_EVENT_TYPES,
   TERMINAL_RUN_STATUSES,
   type HandshakeResponse,
@@ -51,6 +53,8 @@ const HeartbeatBody = z.object({
 })
 
 const EventBody = z.object({
+  id: z.unknown().optional(),
+  event_id: z.unknown().optional(),
   event_type: z.enum(RUNNER_EVENT_TYPES as [string, ...string[]]),
   payload: z.record(z.string(), z.unknown()).default({}),
   tokens_in: z.number().int().min(0).default(0),
@@ -59,7 +63,7 @@ const EventBody = z.object({
 })
 
 const FinishBody = z.object({
-  status: z.enum(["succeeded", "failed", "killed", "idle_timeout", "pending", "handshaked", "running"]),
+  status: z.enum(RUN_STATUSES),
   message: z.string().max(4000).default(""),
 })
 
@@ -113,6 +117,20 @@ export class RuntimeApi {
       throw new HttpError(409, "This install command has already been used or the run was revoked")
     }
 
+    const run = this.store.getRun(claims.runId)
+    const capabilities = Array.isArray(body.run_env?.capabilities)
+      ? body.run_env.capabilities.filter((c): c is string => typeof c === "string")
+      : []
+
+    if (
+      run?.spend_limit_usd !== null &&
+      run?.spend_limit_usd !== undefined &&
+      !capabilities.includes(RUNNER_CAPABILITY_GUARDRAILS)
+    ) {
+      this.store.endRun(claims.runId, "failed")
+      throw new HttpError(400, "Runner does not support spending guardrails required by this run")
+    }
+
     const agent = this.store.getAgent(claims.agentId)
     if (!agent || agent.status === "revoked") {
       // A config revoked between mint and handshake must not hand out a working run token.
@@ -128,6 +146,7 @@ export class RuntimeApi {
       run_token: runToken.token,
       run_token_expires_at: runToken.expiresAt.toISOString(),
       task: agent.task,
+      spend_limit_usd: run?.spend_limit_usd ?? null,
       permissions: this.store.effectiveRules(agent),
       secrets: this.store.secrets(agent.id).map((s) => ({
         secret_arn: s.reference,
@@ -163,6 +182,7 @@ export class RuntimeApi {
 
     const response: HeartbeatResponse = {
       kill: run.kill_requested_at !== null,
+      kill_reason: run.kill_reason,
       status,
       messages: this.store.messagesAfter(run.id, body.after_event_id ?? null).map((e) => ({
         id: e.id,
@@ -184,12 +204,61 @@ export class RuntimeApi {
     const claims = this.runClaims(req)
     const body = await readBody(req, EventBody, MAX_RUNNER_BODY_BYTES)
     const run = this.activeRun(claims)
-    this.store.addEvent(run.id, body.event_type as any, body.payload, {
-      tokensIn: body.tokens_in,
-      tokensOut: body.tokens_out,
-      costUsd: body.cost_usd ?? null,
-    })
-    return json({ run_id: run.id, status: run.status })
+
+    const isUsageBearing =
+      body.tokens_in > 0 || body.tokens_out > 0 || (body.cost_usd !== null && body.cost_usd !== undefined)
+
+    const rawId = body.event_id ?? body.id
+
+    const hasActiveBudget = run.spend_limit_usd !== null && run.spend_limit_usd !== undefined
+
+    if (hasActiveBudget && isUsageBearing) {
+      if (rawId === undefined || rawId === null) {
+        throw new HttpError(400, "Usage-bearing event requires a valid event ID")
+      }
+    }
+
+    let clientEventId: string | null = null
+    if (rawId !== undefined && rawId !== null) {
+      if (typeof rawId !== "string") {
+        throw new HttpError(400, "Event ID must be a string")
+      }
+      const trimmed = rawId.trim()
+      if (trimmed.length === 0 || trimmed.length > 64) {
+        throw new HttpError(400, "Event ID must be between 1 and 64 characters")
+      }
+      if (!/^[a-zA-Z0-9_\-.:]+$/.test(trimmed)) {
+        throw new HttpError(400, "Malformed event ID: invalid characters")
+      }
+      if (trimmed.includes(":")) {
+        const colonIdx = trimmed.indexOf(":")
+        const scope = trimmed.slice(0, colonIdx)
+        const remainder = trimmed.slice(colonIdx + 1)
+        if (scope !== run.id) {
+          throw new HttpError(400, "Cross-run or invalidly scoped event ID")
+        }
+        if (remainder.length === 0 || remainder.includes(":")) {
+          throw new HttpError(400, "Malformed scoped event ID")
+        }
+      }
+      clientEventId = trimmed
+    }
+
+    const result = this.store.recordEventAndCheckBudget(
+      run.id,
+      body.event_type as any,
+      body.payload,
+      {
+        tokensIn: body.tokens_in,
+        tokensOut: body.tokens_out,
+        costUsd: body.cost_usd ?? null,
+      },
+      clientEventId,
+    )
+    if (result.killTriggered) {
+      this.log(`Run ${run.id} triggered server-side spending halt: ${result.killReason}`)
+    }
+    return json({ run_id: run.id, status: result.run.status })
   }
 
   finish = async (req: Request): Promise<Response> => {
@@ -197,21 +266,19 @@ export class RuntimeApi {
     const body = await readBody(req, FinishBody, MAX_RUNNER_BODY_BYTES)
     const target = body.status as RunStatus
     if (!TERMINAL_RUN_STATUSES.includes(target)) throw new HttpError(400, `${target} is not a terminal status`)
-    const run = this.activeRun(claims)
-    if (!RUN_TRANSITIONS[run.status].includes(target)) {
-      throw new HttpError(409, `Cannot finish as ${target} from ${run.status}`)
+
+    const run = this.store.getRun(claims.runId)
+    if (!run || run.agent_id !== claims.agentId) throw new HttpError(404, "Agent run not found")
+
+    const outcome = this.store.finishRun(run.id, target, body.message)
+    if (!outcome.ok) {
+      throw new HttpError(409, outcome.message)
     }
-    this.store.transaction(() => {
-      this.store.endRun(run.id, target)
-      if (body.message) {
-        // An idle timeout is an outcome, not a fault: a session nobody kept
-        // talking to did not fail.
-        const benign = target === "succeeded" || target === "idle_timeout"
-        this.store.addEvent(run.id, benign ? "summary" : "error", { message: body.message })
-      }
-    })
-    this.log(`Run ${run.id} finished: ${target}`)
-    return json({ run_id: run.id, status: target })
+
+    if (outcome.transitioned) {
+      this.log(`Run ${run.id} finished: ${outcome.status}`)
+    }
+    return json({ run_id: run.id, status: outcome.status })
   }
 
   /**

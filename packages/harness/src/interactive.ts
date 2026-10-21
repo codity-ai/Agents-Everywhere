@@ -27,6 +27,7 @@ import type { RunResult } from "./headless"
 import { request } from "./http"
 import { log } from "./log"
 import type { EventType, Usage } from "./protocol"
+import { terminateChildProcess } from "./process"
 import {
   clip,
   createTranscript,
@@ -36,8 +37,14 @@ import {
   tokenCounts,
   TRANSCRIPT_TEXT_LIMIT,
 } from "./transcript"
+import type { BudgetHalt, SpendingTracker } from "./spending"
 
-type PostEvent = (eventType: EventType, payload: Record<string, unknown>, usage?: Usage) => Promise<unknown>
+type PostEvent = (
+  eventType: EventType,
+  payload: Record<string, unknown>,
+  usage?: Usage,
+  eventId?: string,
+) => Promise<unknown>
 
 const READINESS_ATTEMPTS = 40
 const READINESS_INTERVAL_MS = 250
@@ -69,39 +76,64 @@ function findSessionForDirectory(sessions: unknown, cwd: string): (SessionTotals
  * three times before this. No baseline means new spend cannot be told from old,
  * so nothing is reported rather than a guess.
  */
-async function reportSessionCost(cwd: string, postEvent: PostEvent, baseline: SessionTotals | null) {
-  if (!baseline) {
-    log("No cost baseline for this interactive run, skipping the final cost report.")
-    return
-  }
-  let server: Awaited<ReturnType<typeof startEngineServer>> | undefined
+async function defaultFetchSession(cwd: string): Promise<(SessionTotals & { id: string }) | undefined> {
+  const server = await startEngineServer(cwd, () => {})
   try {
-    server = await startEngineServer(cwd, () => {})
     const res = await request("GET", `${server.baseUrl}/session`, undefined, {
       Authorization: engineAuthHeader(server.password),
     })
     if (res.status < 200 || res.status >= 300 || !Array.isArray(res.data)) {
       throw new Error(`Failed to list sessions (HTTP ${res.status})`)
     }
-    const session = findSessionForDirectory(res.data, cwd)
-    if (!session) return
+    return findSessionForDirectory(res.data, cwd)
+  } finally {
+    terminateChildProcess(server.child)
+  }
+}
+
+export async function reportSessionCost(
+  cwd: string,
+  postEvent: PostEvent,
+  baseline: SessionTotals | null,
+  spending?: SpendingTracker,
+  fetchSession: (cwd: string) => Promise<(SessionTotals & { id: string }) | undefined> = defaultFetchSession,
+): Promise<BudgetHalt | null> {
+  if (!baseline) {
+    log("No cost baseline for this interactive run, skipping the final cost report.")
+    return null
+  }
+  try {
+    const session = await fetchSession(cwd)
+    if (!session) return null
     const tokens = tokenCounts(session.tokens)
     const baselineTokens = tokenCounts(baseline.tokens)
-    const costDelta = (typeof session.cost === "number" ? session.cost : 0) - (baseline.cost || 0)
-    const tokensInDelta = tokens.in - baselineTokens.in
-    const tokensOutDelta = tokens.out - baselineTokens.out
+    const hasKnownSessionCost = typeof session.cost === "number" && Number.isFinite(session.cost)
+    const hasKnownBaselineCost = typeof baseline.cost === "number" && Number.isFinite(baseline.cost)
+    const hasKnownCost = hasKnownSessionCost && (baseline.cost === undefined || hasKnownBaselineCost)
+    const costDelta = hasKnownCost ? Math.max(0, (session.cost as number) - (baseline.cost || 0)) : null
+    const tokensInDelta = Math.max(0, tokens.in - baselineTokens.in)
+    const tokensOutDelta = Math.max(0, tokens.out - baselineTokens.out)
+
     // Nothing new happened (the TUI was opened and closed without a message).
-    if (costDelta <= 0 && tokensInDelta <= 0 && tokensOutDelta <= 0) return
+    if (costDelta === 0 && tokensInDelta <= 0 && tokensOutDelta <= 0) return null
+    const summaryEventId = `summary_${session.id}`
     void postEvent(
       "summary",
       { message: "Interactive session finished" },
-      { tokensIn: Math.max(0, tokensInDelta), tokensOut: Math.max(0, tokensOutDelta), costUsd: Math.max(0, costDelta) },
+      { tokensIn: tokensInDelta, tokensOut: tokensOutDelta, costUsd: costDelta },
+      summaryEventId,
     )
+    if (spending) {
+      return spending.recordFallbackUsage({
+        costUsd: costDelta,
+        tokensIn: tokensInDelta,
+        tokensOut: tokensOutDelta,
+      })
+    }
   } catch (err) {
     log(`Could not report interactive session cost: ${err}`)
-  } finally {
-    if (server) server.child.kill("SIGTERM")
   }
+  return null
 }
 
 export function runInteractive(
@@ -110,8 +142,27 @@ export function runInteractive(
   postEvent: PostEvent,
   onSpawn: (child: ChildProcess) => void,
   onReady: (session: SessionHandle) => void,
+  spending?: SpendingTracker,
+  fetchSession: (cwd: string) => Promise<(SessionTotals & { id: string }) | undefined> = defaultFetchSession,
+  childSpawner: typeof spawn = spawn,
 ): Promise<RunResult> {
+  if (spending) {
+    const admission = spending.canAdmitTurn()
+    if (!admission.ok) {
+      log(`[budget] Interactive session not admitted: ${admission.halt.message}`)
+      return Promise.resolve({
+        success: false,
+        exitCode: 0,
+        error: admission.halt.message,
+        budgetHalt: admission.halt.reason,
+      })
+    }
+  }
+
   return new Promise((resolve) => {
+    let activeChild: ChildProcess | null = null
+    let interactiveHalt: BudgetHalt | null = null
+    let pendingReporting: Promise<unknown> | null = null
     // The TUI's own server once reachable, and the session the person is
     // working in. A message from the control plane goes into that session,
     // where the TUI shows it and the agent answers it like anything typed.
@@ -146,16 +197,34 @@ export function runInteractive(
 
     const sessionHandle = (): SessionHandle => ({
       feedMessage: async (message) => {
-        if (!engine) return false
+        if (interactiveHalt || spending?.haltInfo) {
+          return false
+        }
+        if (spending) {
+          const admission = spending.canAdmitTurn()
+          if (!admission.ok) {
+            log(`[chat] Rejected chat message in interactive session due to spending guardrails: ${admission.halt.message}`)
+            return false
+          }
+          spending.startTurn()
+        }
+        if (!engine) {
+          if (spending) spending.finishTurn()
+          return false
+        }
         try {
           const sessionId = await findActiveSession()
-          if (!sessionId) return false
+          if (!sessionId) {
+            if (spending) spending.finishTurn()
+            return false
+          }
           fedFromControlPlane.add(clip(message, TRANSCRIPT_TEXT_LIMIT))
           // No model: the session's own, which is whatever the person chose in
           // the TUI. Forcing the configured one would undo that choice.
           await sendMessage(engine.baseUrl, engine.authHeader, sessionId, message, undefined)
           return true
         } catch (err) {
+          if (spending) spending.finishTurn()
           log(`Could not hand a message to the session: ${err}`)
           return false
         }
@@ -171,6 +240,7 @@ export function runInteractive(
       // What each open terminal question asked, so its answer can say what it allowed.
       const asked = new Map<string, string>()
       events = subscribeEngineEvents(baseUrl, authHeader, (event) => {
+        if (interactiveHalt || spending?.haltInfo) return
         const props = event.properties || {}
         const part = props.part
         const info = props.info
@@ -218,13 +288,38 @@ export function runInteractive(
           })
         }
         if (event.type === "message.part.updated" && part && part.type === "step-finish") {
-          sawLiveUsage = true
           const tokens = tokenCounts(part.tokens)
-          void postEvent(
+          const hasUsableUsage =
+            (typeof part.cost === "number" && Number.isFinite(part.cost)) || tokens.in > 0 || tokens.out > 0
+          if (hasUsableUsage) {
+            sawLiveUsage = true
+          }
+          if (spending) spending.finishTurn()
+          const stepId = typeof part.id === "string" ? part.id : undefined
+          const stepPost = postEvent(
             "step",
             { kind: "usage", message: "Step finished" },
             { tokensIn: tokens.in, tokensOut: tokens.out, costUsd: typeof part.cost === "number" ? part.cost : null },
+            stepId,
           )
+          const reportingPromise =
+            stepPost && typeof (stepPost as Promise<unknown>).then === "function"
+              ? (stepPost as Promise<unknown>).catch((err) => {
+                  log(`Failed to report usage event: ${err}`)
+                })
+              : null
+          if (reportingPromise) {
+            pendingReporting = reportingPromise
+          }
+          if (spending) {
+            const halt = spending.recordStepUsage(part)
+            if (halt) {
+              interactiveHalt = halt
+              log(`[budget] Stopping interactive session: ${halt.message}`)
+              if (events) events.close()
+              if (activeChild) terminateChildProcess(activeChild)
+            }
+          }
         }
       })
     }
@@ -262,18 +357,37 @@ export function runInteractive(
         ...(model ? ["--model", model] : []),
         ...(port ? ["--port", String(port), "--hostname", "127.0.0.1"] : []),
       ]
-      const child = spawn(engineBinPath(), args, {
+      const child = childSpawner(engineBinPath(), args, {
         cwd,
         env: port ? { ...process.env, AGENTS_EVERYWHERE_SERVER_PASSWORD: password! } : process.env,
         stdio: "inherit",
       })
+      activeChild = child
       onSpawn(child)
       if (port) void waitForServer(port, password!)
 
       child.on("close", async (code) => {
         cancelled = true
         if (events) events.close()
-        if (!sawLiveUsage) await reportSessionCost(cwd, postEvent, baseline)
+        if (pendingReporting) {
+          await pendingReporting
+        }
+        const needsFallback =
+          !sawLiveUsage || (Boolean(spending && spending.limitUsd !== null) && !spending?.hasLiveUsage)
+        if (needsFallback && !interactiveHalt && !spending?.haltInfo) {
+          const fallbackHalt = await reportSessionCost(cwd, postEvent, baseline, spending, fetchSession)
+          if (fallbackHalt) interactiveHalt = fallbackHalt
+        }
+        if (interactiveHalt || spending?.haltInfo) {
+          const halt = interactiveHalt || spending!.haltInfo!
+          resolve({
+            success: false,
+            exitCode: code,
+            error: halt.message,
+            budgetHalt: halt.reason,
+          })
+          return
+        }
         resolve({ success: code === 0, exitCode: code })
       })
       child.on("error", (err) => resolve({ success: false, exitCode: null, error: String(err) }))

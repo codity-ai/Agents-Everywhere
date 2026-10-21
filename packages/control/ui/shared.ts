@@ -8,7 +8,7 @@ export function isLive(status: string | null): boolean {
   return status !== null && LIVE.has(status)
 }
 
-const STATUS: Record<string, [string, string]> = {
+export const STATUS: Record<string, [string, string]> = {
   pending: ["Waiting to install", "neutral"],
   handshaked: ["Starting", "info"],
   running: ["Running", "success"],
@@ -16,6 +16,8 @@ const STATUS: Record<string, [string, string]> = {
   idle_timeout: ["Went quiet", "warning"],
   failed: ["Failed", "error"],
   killed: ["Stopped", "error"],
+  budget_exceeded: ["Budget Exceeded", "warning"],
+  unpriced_usage_halt: ["Unpriced Usage Halt", "warning"],
 }
 
 /** A run's state: a tone dot and a mono label. */
