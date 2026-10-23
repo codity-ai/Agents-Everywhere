@@ -1,6 +1,7 @@
 import { request, type JsonResponse } from "./http"
 import type {
   EventRequest,
+  EventResponse,
   EventType,
   FinishStatus,
   HandshakeRequest,
@@ -38,15 +39,21 @@ export class RunnerClient {
     return request("POST", `${this.apiUrl}/agents/runtime/heartbeat`, body, this.headers())
   }
 
-  postEvent(eventType: EventType, payload: Record<string, unknown>, usage: Usage = {}) {
+  postEvent(
+    eventType: EventType,
+    payload: Record<string, unknown>,
+    usage: Usage = {},
+    eventId?: string,
+  ): Promise<JsonResponse<EventResponse>> {
     const body: EventRequest = {
+      ...(eventId ? { event_id: eventId } : {}),
       event_type: eventType,
       payload,
       tokens_in: usage.tokensIn || 0,
       tokens_out: usage.tokensOut || 0,
       cost_usd: usage.costUsd ?? null,
     }
-    return request("POST", `${this.apiUrl}/agents/runtime/events`, body, this.headers())
+    return request<EventResponse>("POST", `${this.apiUrl}/agents/runtime/events`, body, this.headers())
   }
 
   finish(status: FinishStatus, message: string) {

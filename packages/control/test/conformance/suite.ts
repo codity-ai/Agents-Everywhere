@@ -321,6 +321,51 @@ export const CHECKS: Check[] = [
       )
     },
   },
+  {
+    name: "event replay with the same identity and payload is idempotent and preserves usage",
+    async run(a) {
+      const { runToken } = await startRun(a)
+      const eventId = "evt_dedup_test_1"
+      const body = {
+        event_id: eventId,
+        event_type: "step",
+        payload: { kind: "tool", message: "Step 1" },
+        tokens_in: 50,
+        tokens_out: 10,
+        cost_usd: 0.002,
+      }
+      const first = await post(a, "/agents/runtime/events", runToken, body)
+      expect(first.status === 200, `first event answered ${first.status}`)
+      const replay = await post(a, "/agents/runtime/events", runToken, body)
+      expect(replay.status === 200, `replayed event answered ${replay.status}`)
+      expect(replay.data.duplicate === true, "replayed event was not acknowledged as duplicate")
+    },
+  },
+  {
+    name: "reusing an event identity with a different payload is rejected with 409",
+    async run(a) {
+      const { runToken } = await startRun(a)
+      const eventId = "evt_conflict_test_1"
+      const first = await post(a, "/agents/runtime/events", runToken, {
+        event_id: eventId,
+        event_type: "step",
+        payload: { message: "Original payload" },
+        tokens_in: 10,
+        tokens_out: 5,
+        cost_usd: 0.001,
+      })
+      expect(first.status === 200, `first event answered ${first.status}`)
+      const conflict = await post(a, "/agents/runtime/events", runToken, {
+        event_id: eventId,
+        event_type: "step",
+        payload: { message: "Different payload" },
+        tokens_in: 10,
+        tokens_out: 5,
+        cost_usd: 0.001,
+      })
+      expect(conflict.status === 409, `conflicting event answered ${conflict.status}, expected 409`)
+    },
+  },
 ]
 
 export async function runChecks(adapter: ControlPlaneAdapter, checks = CHECKS) {

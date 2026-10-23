@@ -14,7 +14,7 @@
  */
 
 /** Sent in run_env at handshake and returned by servers that know it. */
-export const PROTOCOL_VERSION = 1
+export const PROTOCOL_VERSION = 2
 
 export const RUN_STATUSES = [
   "pending",
@@ -148,11 +148,20 @@ export interface HeartbeatResponse {
 }
 
 export interface EventRequest {
+  event_id?: string
   event_type: EventType
   payload: Record<string, unknown>
   tokens_in: number
   tokens_out: number
   cost_usd: number | null
+}
+
+export interface EventResponse {
+  run_id: string
+  status: RunStatus
+  event_id?: string
+  acknowledged?: boolean
+  duplicate?: boolean
 }
 
 export type FinishStatus = "succeeded" | "failed" | "killed" | "idle_timeout"
