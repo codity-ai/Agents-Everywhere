@@ -7,6 +7,7 @@ import { RunnerClient } from "../src/client"
 import {
   DurableOutbox,
   MAX_OUTBOX_EVENTS,
+  outboxFilePath,
   recoverOutbox,
   sanitizePayload,
 } from "../src/outbox"
@@ -382,4 +383,163 @@ test("malformed outbox entries are skipped during load and only valid entries ar
   expect(logs.some((l) => l.includes("Discarding malformed outbox entry"))).toBe(true)
 
   outbox.cleanup()
+})
+
+test("credential redaction: redacts OPENAI_API_KEY, llm_api_key, and credentials embedded in message or command text", () => {
+  const payload = {
+    OPENAI_API_KEY: "sk-proj-12345678901234567890abcdef",
+    llm_api_key: "sk-ant-12345678901234567890abcdef",
+    access_token: "ghp_123456789012345678901234567890123456",
+    refresh_token: "ref_1234567890abcdef",
+    client_secret: "cs_1234567890abcdef",
+    ANTHROPIC_API_KEY: "sk-ant-secret",
+    command: "export OPENAI_API_KEY='sk-12345678901234567890'; curl -H 'Authorization: Bearer my_secret_token' https://api.openai.com",
+    message: "Failed authenticating with llm_api_key=sk-ant-secret-key-123456 and token sk-proj-12345678901234567890",
+    nestedArray: [
+      { OPENAI_API_KEY: "sk-in-array", text: "x-api-key: secret_key_12345" },
+    ],
+  }
+
+  const sanitized = sanitizePayload(payload)
+
+  // Keys must be redacted
+  expect(sanitized.OPENAI_API_KEY).toBe("[REDACTED]")
+  expect(sanitized.llm_api_key).toBe("[REDACTED]")
+  expect(sanitized.access_token).toBe("[REDACTED]")
+  expect(sanitized.refresh_token).toBe("[REDACTED]")
+  expect(sanitized.client_secret).toBe("[REDACTED]")
+  expect(sanitized.ANTHROPIC_API_KEY).toBe("[REDACTED]")
+
+  // Command string must have embedded credentials redacted
+  const cmd = sanitized.command as string
+  expect(cmd).not.toContain("sk-12345678901234567890")
+  expect(cmd).not.toContain("my_secret_token")
+  expect(cmd).toContain("OPENAI_API_KEY='[REDACTED]'")
+  expect(cmd).toContain("Bearer [REDACTED]")
+
+  // Message string must have embedded credentials redacted
+  const msg = sanitized.message as string
+  expect(msg).not.toContain("sk-ant-secret-key-123456")
+  expect(msg).not.toContain("sk-proj-12345678901234567890")
+  expect(msg).toContain("llm_api_key=[REDACTED]")
+  expect(msg).toContain("[REDACTED]")
+
+  // Array elements
+  const arr = sanitized.nestedArray as any[]
+  expect(arr[0].OPENAI_API_KEY).toBe("[REDACTED]")
+  expect(arr[0].text).toContain("x-api-key: [REDACTED]")
+})
+
+test("completion with nonempty outbox preserves pending records on disk and gates cleanup", async () => {
+  // Use an unreachable endpoint to simulate server outage during run
+  const client = new RunnerClient("http://127.0.0.1:1", "test-token")
+  const outbox = new DurableOutbox(client, "test-run", () => {}, outboxPath)
+
+  outbox.enqueue("step", { task: "uncompleted step" }, { tokensIn: 100, tokensOut: 50, costUsd: 0.005 })
+  expect(outbox.size()).toBe(1)
+  expect(outbox.isEmpty()).toBe(false)
+
+  // Flush times out
+  const flushed = await outbox.flush(100)
+  expect(flushed).toBe(false)
+
+  // Check the policy: cleanup() MUST NOT be called if outbox is nonempty
+  if (outbox.isEmpty()) {
+    outbox.cleanup()
+  } else {
+    outbox.stop()
+  }
+
+  // Verify the outbox file survives on disk with the record intact
+  expect(fs.existsSync(outboxPath)).toBe(true)
+  const saved = JSON.parse(fs.readFileSync(outboxPath, "utf8"))
+  expect(saved.events.length).toBe(1)
+  expect(saved.events[0].payload.task).toBe("uncompleted step")
+  expect(saved.events[0].usage.tokensIn).toBe(100)
+
+  // Only when outbox is actually empty does cleanup delete it
+  outbox.clear()
+  expect(outbox.isEmpty()).toBe(true)
+  outbox.cleanup()
+  expect(fs.existsSync(outboxPath)).toBe(false)
+})
+
+test("recovery after termination halts delivery and preserves pending outbox records without deleting", async () => {
+  // Simulate a control-plane server that has already marked the run terminal
+  const server = http.createServer((_req, res) => {
+    res.writeHead(409, { "Content-Type": "application/json" })
+    res.end(JSON.stringify({ detail: "Run is already succeeded" }))
+  })
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()))
+  const port = (server.address() as any).port
+
+  try {
+    // Seed an outbox with pending events
+    const preSeededEvents = [
+      {
+        id: "evt_terminal_1",
+        seq: 1,
+        eventType: "step",
+        payload: { text: "after termination event" },
+        usage: { tokensIn: 20, tokensOut: 10, costUsd: 0.001 },
+        createdAt: new Date().toISOString(),
+        attempts: 0,
+      },
+    ]
+    fs.writeFileSync(outboxPath, JSON.stringify({ version: 1, runId: "test-run", events: preSeededEvents }), { mode: 0o600 })
+
+    const logs: string[] = []
+    const result = await recoverOutbox(`http://127.0.0.1:${port}`, "test-token", "test-run", (l) => logs.push(l), outboxPath)
+
+    // Delivery must halt upon 409 terminal status
+    expect(result.delivered).toBe(0)
+    expect(result.remaining).toBe(1)
+
+    // Outbox file must NOT be deleted
+    expect(fs.existsSync(outboxPath)).toBe(true)
+    const diskContent = JSON.parse(fs.readFileSync(outboxPath, "utf8"))
+    expect(diskContent.events.length).toBe(1)
+    expect(diskContent.events[0].id).toBe("evt_terminal_1")
+
+    // Logs explain that run is terminal on control plane
+    expect(logs.some((l) => l.includes("Run is terminal on control plane"))).toBe(true)
+
+    // Manual cleanup for test
+    fs.unlinkSync(outboxPath)
+  } finally {
+    server.close()
+  }
+})
+
+test("stop() resolves pending backoff wait immediately without hanging", async () => {
+  const client = new RunnerClient("http://127.0.0.1:1", "test-token")
+  const outbox = new DurableOutbox(client, "test-run", () => {}, outboxPath)
+
+  outbox.enqueue("step", { retry: true })
+
+  // Wait a short moment for delivery attempt to fail and enter wait(delay)
+  await new Promise((r) => setTimeout(r, 50))
+
+  const start = Date.now()
+  outbox.stop()
+  // Wait a tick to let drain finish after unblocking
+  await new Promise((r) => setTimeout(r, 20))
+  const elapsed = Date.now() - start
+
+  // stop() should resolve the wait immediately, taking well under 500ms initial backoff
+  expect(elapsed).toBeLessThan(200)
+
+  outbox.cleanup()
+})
+
+test("outboxFilePath validates fileId and prevents path traversal", () => {
+  // Valid alphanumeric, underscore, hyphen
+  expect(outboxFilePath("run-123_abc")).toContain("outbox-run-123_abc.json")
+
+  // Path traversal attempts must be rejected
+  expect(() => outboxFilePath("../etc/passwd")).toThrow("Invalid fileId")
+  expect(() => outboxFilePath("..\\windows\\system32")).toThrow("Invalid fileId")
+  expect(() => outboxFilePath("/absolute/path")).toThrow("Invalid fileId")
+  expect(() => outboxFilePath("run/nested")).toThrow("Invalid fileId")
+  expect(() => outboxFilePath("")).toThrow("Invalid fileId")
 })

@@ -215,13 +215,17 @@ class Run {
     if (this.activeChild) this.activeChild.kill("SIGTERM")
     // process.exit skips the run's finally, so the config is removed here too.
     this.removeEngineConfig()
-    const flushed = await this.outbox.flush(3_000)
-    await this.finish("killed", `stopped by ${signal}`)
-    if (flushed) {
+    await this.outbox.flush(3_000)
+    const finished = await this.finish("killed", `stopped by ${signal}`)
+    if (this.outbox.isEmpty()) {
       this.outbox.cleanup()
     } else {
       this.outbox.stop()
-      log(`Outbox has ${this.outbox.size()} unflushed event(s); use --recover-outbox ${this.fileId} to retry.`)
+      if (finished.status === 200) {
+        log(`Outbox has ${this.outbox.size()} unflushed event(s) preserved at ${this.outbox.filePath}.`)
+      } else {
+        log(`Outbox has ${this.outbox.size()} unflushed event(s); use --recover-outbox ${this.fileId} to retry.`)
+      }
     }
     process.exit(1)
   }
@@ -430,13 +434,17 @@ class Run {
     clearTimeout(this.heartbeatTimer)
 
     if (this.killed) {
-      const flushed = await this.outbox.flush(5_000)
-      await this.finish("killed", "stopped by operator")
-      if (flushed) {
+      await this.outbox.flush(5_000)
+      const finished = await this.finish("killed", "stopped by operator")
+      if (this.outbox.isEmpty()) {
         this.outbox.cleanup()
       } else {
         this.outbox.stop()
-        log(`Outbox has ${this.outbox.size()} unflushed event(s); use --recover-outbox ${this.fileId} to retry.`)
+        if (finished.status === 200) {
+          log(`Outbox has ${this.outbox.size()} unflushed event(s) preserved at ${this.outbox.filePath}.`)
+        } else {
+          log(`Outbox has ${this.outbox.size()} unflushed event(s); use --recover-outbox ${this.fileId} to retry.`)
+        }
       }
       log("Run stopped.")
       return 0
@@ -459,7 +467,19 @@ class Run {
     const finished = await this.finish(status, message)
     if (finished.status === 200) {
       log(`Run ${status}.`)
-      this.outbox.cleanup()
+      if (this.outbox.isEmpty()) {
+        this.outbox.cleanup()
+      } else {
+        this.outbox.stop()
+        log(`Outbox has ${this.outbox.size()} unflushed event(s) preserved at ${this.outbox.filePath}.`)
+      }
+    } else {
+      this.outbox.stop()
+      if (this.outbox.isEmpty()) {
+        this.outbox.cleanup()
+      } else {
+        log(`Outbox has ${this.outbox.size()} unflushed event(s); use --recover-outbox ${this.fileId} to retry.`)
+      }
     }
     return result.success && finished.status === 200 ? 0 : 1
   }

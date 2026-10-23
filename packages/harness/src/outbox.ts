@@ -27,13 +27,42 @@ interface OutboxData {
   events: OutboxEntry[]
 }
 
-const SENSITIVE_KEYS = /^(password|token|secret|apiKey|api_key|authorization|bearer|auth|cookie|key)$/i
+const SENSITIVE_KEY_PATTERN = /(password|token|secret|apikey|api_key|auth|bearer|cookie|credential|client_secret)/i
+
+export function isSensitiveKey(k: string): boolean {
+  if (SENSITIVE_KEY_PATTERN.test(k)) return true
+  // Match keys ending in "key" or "Key", like "apiKey", "privateKey", "ssh_key", "OPENAI_API_KEY", "key"
+  if (/(?:^|[_-])key(?:$|[_-])/i.test(k) || /[a-z0-9]Key$/i.test(k) || /^[A-Z0-9_]*KEY$/.test(k)) return true
+  return false
+}
+
 const BEARER_PATTERN = /(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi
+
+const KNOWN_KEY_PATTERNS = [
+  /\bsk-[A-Za-z0-9][A-Za-z0-9_-]{19,}\b/g,
+  /\bAIza[0-9A-Za-z_-]{20,}\b/g,
+  /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
+  /\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g,
+]
+
+const EMBEDDED_CREDENTIAL_PATTERN =
+  /((?:--?(?:api[_-]?key|token|password|secret|auth)|(?:export\s+)?[A-Za-z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD|llm_api_key)[A-Za-z0-9_]*|x-api-key)\s*[:=]\s*)(?:(["'])(.*?)\2|([^\s;&|,]+))/gi
+
+export function sanitizeString(str: string): string {
+  let res = str.replace(BEARER_PATTERN, "$1[REDACTED]")
+  res = res.replace(EMBEDDED_CREDENTIAL_PATTERN, (_match, p1, quote) =>
+    quote ? `${p1}${quote}[REDACTED]${quote}` : `${p1}[REDACTED]`,
+  )
+  for (const pat of KNOWN_KEY_PATTERNS) {
+    res = res.replace(pat, "[REDACTED]")
+  }
+  return res
+}
 
 /** Recursively sanitize a single value (string, object, or array). */
 function sanitizeValue(v: unknown): unknown {
   if (typeof v === "string") {
-    return v.replace(BEARER_PATTERN, "$1[REDACTED]")
+    return sanitizeString(v)
   }
   if (Array.isArray(v)) {
     return v.map(sanitizeValue)
@@ -48,7 +77,7 @@ function sanitizeValue(v: unknown): unknown {
 export function sanitizePayload(obj: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {}
   for (const [k, v] of Object.entries(obj)) {
-    if (SENSITIVE_KEYS.test(k)) {
+    if (isSensitiveKey(k)) {
       out[k] = "[REDACTED]"
     } else {
       out[k] = sanitizeValue(v)
@@ -58,7 +87,15 @@ export function sanitizePayload(obj: Record<string, unknown>): Record<string, un
 }
 
 export function outboxFilePath(fileId: string): string {
-  return path.join(runnerHome(), `outbox-${fileId}.json`)
+  if (!fileId || !/^[A-Za-z0-9_-]+$/.test(fileId)) {
+    throw new Error(`Invalid fileId for outbox: ${fileId}`)
+  }
+  const home = runnerHome()
+  const resolved = path.resolve(home, `outbox-${fileId}.json`)
+  if (!resolved.startsWith(path.resolve(home))) {
+    throw new Error(`Path traversal detected in outboxFilePath: ${fileId}`)
+  }
+  return resolved
 }
 
 export class DurableOutbox {
@@ -68,6 +105,7 @@ export class DurableOutbox {
   private stopped = false
   private backoffDelay = INITIAL_BACKOFF_MS
   private retryTimer: ReturnType<typeof setTimeout> | undefined
+  private retryResolver: (() => void) | undefined
   private flushResolvers: Array<() => void> = []
 
   readonly filePath: string
@@ -228,7 +266,7 @@ export class DurableOutbox {
   }
 
   private notifyFlush() {
-    if (this.queue.length === 0) {
+    if (this.queue.length === 0 || (this.stopped && !this.delivering)) {
       const resolvers = this.flushResolvers
       this.flushResolvers = []
       for (const resolve of resolvers) resolve()
@@ -299,13 +337,18 @@ export class DurableOutbox {
   private wait(ms: number): Promise<void> {
     return new Promise((resolve) => {
       clearTimeout(this.retryTimer)
-      this.retryTimer = setTimeout(resolve, ms)
+      this.retryResolver = resolve
+      this.retryTimer = setTimeout(() => {
+        this.retryResolver = undefined
+        resolve()
+      }, ms)
     })
   }
 
   /** Awaits until all queued events are acknowledged or until timeout. */
   async flush(timeoutMs = 15_000): Promise<boolean> {
     if (this.queue.length === 0) return true
+    if (this.stopped && this.queue.length === 0) return true; // if stopped and empty, nothing to do
     this.triggerDelivery()
     return new Promise((resolve) => {
       let timer: ReturnType<typeof setTimeout>
@@ -325,6 +368,12 @@ export class DurableOutbox {
   stop() {
     this.stopped = true
     clearTimeout(this.retryTimer)
+    if (this.retryResolver) {
+      const resolve = this.retryResolver
+      this.retryResolver = undefined
+      resolve()
+    }
+    this.notifyFlush()
   }
 
   clear() {
@@ -344,6 +393,10 @@ export class DurableOutbox {
 
   size(): number {
     return this.queue.length
+  }
+
+  isEmpty(): boolean {
+    return this.queue.length === 0
   }
 }
 
