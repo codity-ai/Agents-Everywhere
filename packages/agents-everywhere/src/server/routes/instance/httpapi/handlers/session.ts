@@ -411,6 +411,9 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     })
 
     return handlers
+      .handleRaw("recoveryCapabilities", () =>
+        Effect.sync(() => HttpServerResponse.jsonUnsafe({ version: 1, mandatoryPolicies: true, recovery: false })),
+      )
       .handle("list", list)
       .handle("status", status)
       .handle("get", get)

@@ -2,6 +2,7 @@ import { LayerNode } from "@agents-everywhere/core/effect/layer-node"
 import { ConfigPermissionV1 } from "@agents-everywhere/core/v1/config/permission"
 import { InstanceState } from "@/effect/instance-state"
 import { Wildcard } from "@agents-everywhere/core/util/wildcard"
+import { match as mandatoryMatch } from "@agents-everywhere/core/permission/mandatory"
 import { Deferred, Effect, Layer, Context } from "effect"
 import os from "os"
 import { PermissionV1 } from "@agents-everywhere/core/v1/permission"
@@ -56,6 +57,9 @@ function specificity(rule: PermissionV1.Rule): number {
  * than silently resolving either way.
  */
 export function evaluate(permission: string, pattern: string, ...rulesets: PermissionV1.Ruleset[]): PermissionV1.Rule {
+  // A control plane's mandatory deny outranks every layer (core/permission/mandatory.ts).
+  const mandatory = mandatoryMatch(permission, pattern)
+  if (mandatory) return mandatory
   let best: PermissionV1.Rule | undefined
   let bestScore = -1
 

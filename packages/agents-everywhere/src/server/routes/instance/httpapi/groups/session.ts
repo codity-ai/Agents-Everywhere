@@ -200,6 +200,11 @@ export const SessionApi = HttpApi.make("session")
             description: "Retrieve a specific message from a session by its message ID.",
           }),
         ),
+        // What a control plane may rely on (codity harness): mandatory deny rules
+        // (CODITY_MANDATORY_RULES) are enforced; checkpoint recovery is not built in.
+        HttpApiEndpoint.get("recoveryCapabilities", `${root}/recovery/capabilities`, {
+          success: Schema.Struct({ version: Schema.Literal(1), mandatoryPolicies: Schema.Boolean, recovery: Schema.Boolean }),
+        }),
         HttpApiEndpoint.post("create", SessionPaths.create, {
           query: WorkspaceRoutingQuery,
           payload: [HttpApiSchema.NoContent, Session.CreateInput],

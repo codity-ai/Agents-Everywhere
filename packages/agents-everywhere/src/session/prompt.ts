@@ -449,6 +449,8 @@ const layer = Layer.effect(
     })
 
     const shellImpl = Effect.fn("SessionPrompt.shellImpl")(function* (input: ShellInput, ready?: Latch.Latch) {
+      // A user shell runs outside the permission system, so a managed run has none.
+      if (process.env.CODITY_MANDATORY_RULES) return yield* Effect.die(new Error("Use the agent bash tool for managed runs so policies apply"))
       return yield* Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           const markReady = ready ? ready.open.pipe(Effect.asVoid) : Effect.void
@@ -1231,6 +1233,7 @@ const layer = Layer.effect(
               bypassAgentCheck,
               messages: msgs,
               promptOps,
+              currentSession: () => sessions.get(sessionID).pipe(Effect.orElseSucceed(() => session)),
             }).pipe(
               Effect.provideService(Plugin.Service, plugin),
               Effect.provideService(Permission.Service, permission),
@@ -1396,6 +1399,7 @@ const layer = Layer.effect(
 
       const shellMatches = ConfigMarkdown.shell(template)
       if (shellMatches.length > 0) {
+        if (process.env.CODITY_MANDATORY_RULES) return yield* Effect.die(new Error("Shell substitutions in custom commands are disabled for managed agents. Use the agent bash tool so policies apply."))
         const cfg = yield* config.get()
         const sh = Shell.preferred(cfg.shell)
         const results = yield* Effect.promise(() =>

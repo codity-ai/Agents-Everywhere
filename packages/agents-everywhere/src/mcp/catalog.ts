@@ -39,7 +39,18 @@ export function defs(client: Client, timeout?: number) {
   return listTools(client, timeout ?? DEFAULT_TIMEOUT).pipe(Effect.catch(() => Effect.void))
 }
 
-export function convertTool(mcpTool: MCPToolDef, client: Client, timeout?: number): Tool {
+/**
+ * `meta` is read at call time and sent as the request's `_meta`. A control plane
+ * uses it to give every call the identity of the session that made it (a short-lived
+ * user token, the session id) without baking one person's credential into the
+ * instance-wide MCP connection, which every session of the instance shares.
+ */
+export function convertTool(
+  mcpTool: MCPToolDef,
+  client: Client,
+  timeout?: number,
+  meta?: () => Promise<Record<string, unknown> | undefined>,
+): Tool {
   const inputSchema: JSONSchema7 = {
     ...(mcpTool.inputSchema as JSONSchema7),
     type: "object",
@@ -51,10 +62,12 @@ export function convertTool(mcpTool: MCPToolDef, client: Client, timeout?: numbe
     description: mcpTool.description ?? "",
     inputSchema: jsonSchema(inputSchema),
     execute: async (args: unknown, options) => {
+      const extra = meta ? await meta() : undefined
       const result = await client.callTool(
         {
           name: mcpTool.name,
           arguments: (args || {}) as Record<string, unknown>,
+          ...(extra && Object.keys(extra).length > 0 ? { _meta: extra } : {}),
         },
         CallToolResultSchema,
         {

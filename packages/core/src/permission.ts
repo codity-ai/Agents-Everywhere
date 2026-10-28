@@ -9,6 +9,7 @@ import { AgentV2 } from "./agent"
 import { SessionV2 } from "./session"
 import { SessionStore } from "./session/store"
 import { Wildcard } from "./util/wildcard"
+import { match } from "./permission/mandatory"
 import { PermissionSaved } from "./permission/saved"
 
 export { Effect, Rule, Ruleset } from "@agents-everywhere/schema/permission"
@@ -74,6 +75,7 @@ export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("Per
 export type Error = BlockedError | CorrectedError
 
 export function evaluate(action: string, resource: string, ...rulesets: Permission.Ruleset[]): Permission.Rule {
+  if (match(action, resource)) return { action, resource, effect: "deny" }
   return (
     rulesets
       .flat()

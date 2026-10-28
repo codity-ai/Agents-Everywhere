@@ -46,6 +46,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   bypassAgentCheck: boolean
   messages: SessionV1.WithParts[]
   promptOps: TaskPromptOps
+  /** The session as stored now. MCP call metadata is read through it at call time,
+   *  because a control plane refreshes it (a new short-lived token) while a call
+   *  waits on a permission decision. Defaults to `session` as resolved. */
+  currentSession?: () => Effect.Effect<Session.Info>
 }) {
   const tools: Record<string, AITool> = {}
   const run = yield* EffectBridge.make()
@@ -388,7 +392,14 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   if (flags.experimentalCodeMode) return tools
 
   for (const [key, entry] of Object.entries(yield* mcp.tools())) {
-    const item = McpCatalog.convertTool(entry.def, entry.client, entry.timeout)
+    const item = McpCatalog.convertTool(entry.def, entry.client, entry.timeout, () =>
+      run.promise(
+        (input.currentSession ?? (() => Effect.succeed(input.session)))().pipe(
+          Effect.map((session) => mcpCallMeta(session, entry.server)),
+          Effect.orElseSucceed(() => mcpCallMeta(input.session, entry.server)),
+        ),
+      ),
+    )
     const execute = item.execute
     if (!execute) continue
 
@@ -405,7 +416,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             { args },
           )
           const result: Awaited<ReturnType<NonNullable<typeof execute>>> = yield* Effect.gen(function* () {
-            yield* ctx.ask({ permission: key, metadata: {}, patterns: ["*"], always: ["*"] })
+            // The arguments go with the request, so whoever decides sees exactly
+            // what will be sent and can bind the decision to it.
+            yield* ctx.ask({ permission: key, metadata: { input: args }, patterns: ["*"], always: ["*"] })
             return yield* Effect.promise(() => execute(args, opts))
           }).pipe(
             Effect.withSpan("Tool.execute", {
@@ -464,6 +477,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           const truncated = yield* truncate.output(textParts.join("\n\n"), {}, input.agent)
           const metadata = {
             ...result.metadata,
+            // The result's own `_meta` (MCP's channel for data that is not for the
+            // model) stays on the tool part, where a control plane reads it.
+            ...(isRecord(result._meta) && { mcp: result._meta }),
             truncated: truncated.truncated,
             ...(truncated.truncated && { outputPath: truncated.outputPath }),
           }
@@ -491,6 +507,22 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
 
   return tools
 })
+
+/**
+ * `_meta` for one MCP call: the session id, plus the string values a control plane
+ * put on the session under `metadata.mcp[server].meta`. Anything else is ignored, so
+ * session metadata written for other purposes never reaches an MCP server.
+ */
+export function mcpCallMeta(session: Session.Info, server?: string): Record<string, string> {
+  const servers = toRecord(toRecord(session.metadata).mcp)
+  const meta = server ? toRecord(toRecord(servers[server]).meta) : {}
+  return {
+    "agents-everywhere/session": session.id,
+    ...Object.fromEntries(
+      Object.entries(meta).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+    ),
+  }
+}
 
 function toRecord(value: unknown) {
   if (isRecord(value)) return value
