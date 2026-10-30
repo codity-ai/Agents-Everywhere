@@ -96,6 +96,7 @@ export async function runHeadless(
 
   let resolveFinished!: (result: RunResult) => void
   const finished = new Promise<RunResult>((r) => (resolveFinished = r))
+  const pendingUsage = new Set<Promise<unknown>>()
   let idleTimer: ReturnType<typeof setTimeout> | undefined
   let lastError: unknown = null
   // A run that produced no step and no output did not succeed at its task, it
@@ -194,34 +195,33 @@ export async function runHeadless(
         if (spending) spending.finishTurn()
         const tokens = tokenCounts(part.tokens)
         const stepId = typeof part.id === "string" ? part.id : undefined
-        const stepPost = hooks.onStep(
-          { kind: "usage", message: "Step finished" },
-          { tokensIn: tokens.in, tokensOut: tokens.out, costUsd: typeof part.cost === "number" ? part.cost : null },
-          stepId,
-        )
+        const stepPost = Promise.resolve(
+          hooks.onStep(
+            { kind: "usage", message: "Step finished" },
+            { tokensIn: tokens.in, tokensOut: tokens.out, costUsd: typeof part.cost === "number" ? part.cost : null },
+            stepId,
+          ),
+        ).catch((err) => log(`Failed to post usage: ${err}`))
+        pendingUsage.add(stepPost)
+        void stepPost.then(() => pendingUsage.delete(stepPost))
         if (spending) {
           const halt = spending.recordStepUsage(part)
           if (halt) {
             onLine(`[budget] Stopping run: ${halt.message}`)
-            void (async () => {
-              if (stepPost && typeof (stepPost as Promise<unknown>).then === "function") {
-                await (stepPost as Promise<unknown>).catch(() => {})
+            void abortSession(baseUrl, authHeader, sessionId).then((abortRes) => {
+              if (!abortRes.ok) {
+                log(`Session abort request did not succeed: ${abortRes.error || `HTTP ${abortRes.status}`}`)
               }
-              void abortSession(baseUrl, authHeader, sessionId).then((abortRes) => {
-                if (!abortRes.ok) {
-                  log(`Session abort request did not succeed: ${abortRes.error || `HTTP ${abortRes.status}`}`)
-                }
-              })
-              clearTimeout(idleTimer)
-              events.close()
-              terminateChildProcess(child)
-              resolveFinished({
-                success: false,
-                exitCode: 0,
-                error: halt.message,
-                budgetHalt: halt.reason,
-              })
-            })()
+            })
+            clearTimeout(idleTimer)
+            events.close()
+            terminateChildProcess(child)
+            resolveFinished({
+              success: false,
+              exitCode: 0,
+              error: halt.message,
+              budgetHalt: halt.reason,
+            })
             return
           }
         }
@@ -375,5 +375,7 @@ export async function runHeadless(
   clearTimeout(idleTimer)
   events.close()
   terminateChildProcess(child)
+  // Child exits and idle timeouts must also flush usage before the run becomes terminal.
+  await Promise.all(pendingUsage)
   return result
 }

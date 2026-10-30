@@ -14,6 +14,8 @@ import { TodoWriteTool } from "./todowrite"
 import { WebFetchTool } from "./webfetch"
 import { WebSearchTool } from "./websearch"
 import { WriteTool } from "./write"
+import { DeployTool } from "./deploy"
+import { PublishPRTool } from "./publish-pr"
 
 /**
  * Composes only the shipped Location-scoped built-in tool transforms.
@@ -34,6 +36,8 @@ export const node = makeLocationNode({
   deps: [
     ApplyPatchTool.node,
     BashTool.node,
+    PublishPRTool.node,
+    DeployTool.node,
     EditTool.node,
     GlobTool.node,
     GrepTool.node,

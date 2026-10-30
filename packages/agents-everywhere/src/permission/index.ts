@@ -117,7 +117,7 @@ const layer = Layer.effect(
             ruleset: ruleset.filter((rule) => Wildcard.match(request.permission, rule.permission)),
           })
         }
-        if (rule.action === "allow") continue
+		if (rule.action === "allow" && !["codity_pr_publish", "codity_deployment"].includes(request.permission)) continue
         undecided.push(pattern)
       }
 
@@ -192,6 +192,7 @@ const layer = Layer.effect(
 
       for (const [id, item] of pending.entries()) {
         if (item.info.sessionID !== existing.info.sessionID) continue
+        if (["codity_pr_publish", "codity_deployment"].includes(item.info.permission)) continue
         const ok = item.info.patterns.every(
           (pattern) => evaluate(item.info.permission, pattern, approved).action === "allow",
         )

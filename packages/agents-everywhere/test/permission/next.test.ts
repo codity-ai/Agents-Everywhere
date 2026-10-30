@@ -585,6 +585,47 @@ test("disabled - specific allow overrides wildcard deny", () => {
 
 // ask tests
 
+it.instance("publish permission always prompts despite allow rules and cannot be remembered", () => Effect.gen(function* () {
+  const permission = yield* Permission.Service
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const fiber = yield* permission.ask({
+      sessionID: SessionID.make("session_publish"), permission: "codity_pr_publish",
+      patterns: ["operation: fingerprint"], metadata: { preview: "publish preview" }, always: [],
+      ruleset: [{ permission: "*", pattern: "*", action: "allow" }],
+    }).pipe(Effect.forkScoped)
+    const pending = yield* waitForPending(1)
+    expect(pending[0].permission).toBe("codity_pr_publish")
+    yield* permission.reply({ requestID: pending[0].id, reply: "always" })
+    yield* Fiber.join(fiber)
+  }
+  const error = yield* fail(permission.ask({
+    sessionID: SessionID.make("session_publish"), permission: "codity_pr_publish",
+    patterns: ["operation: fingerprint"], metadata: {}, always: [],
+    ruleset: [{ permission: "codity_pr_publish", pattern: "*", action: "deny" }],
+  }))
+  expect(error).toBeInstanceOf(PermissionV1.DeniedError)
+}), { git: true })
+it.instance("deployment permission always prompts despite allow rules and cannot be remembered", () => Effect.gen(function* () {
+  const permission = yield* Permission.Service
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const fiber = yield* permission.ask({
+      sessionID: SessionID.make("session_publish"), permission: "codity_deployment",
+      patterns: ["operation: fingerprint"], metadata: { preview: "publish preview" }, always: [],
+      ruleset: [{ permission: "*", pattern: "*", action: "allow" }],
+    }).pipe(Effect.forkScoped)
+    const pending = yield* waitForPending(1)
+    expect(pending[0].permission).toBe("codity_deployment")
+    yield* permission.reply({ requestID: pending[0].id, reply: "always" })
+    yield* Fiber.join(fiber)
+  }
+  const error = yield* fail(permission.ask({
+    sessionID: SessionID.make("session_publish"), permission: "codity_deployment",
+    patterns: ["operation: fingerprint"], metadata: {}, always: [],
+    ruleset: [{ permission: "codity_deployment", pattern: "*", action: "deny" }],
+  }))
+  expect(error).toBeInstanceOf(PermissionV1.DeniedError)
+}), { git: true })
+
 it.instance(
   "ask - resolves immediately when action is allow",
   () =>

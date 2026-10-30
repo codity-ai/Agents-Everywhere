@@ -103,6 +103,34 @@ function waitForRequest() {
 }
 
 describe("PermissionV2", () => {
+  it.effect("publish approval cannot be bypassed by saved or configured allow rules", () => Effect.gen(function* () {
+    yield* setup([{action:"*",resource:"*",effect:"allow"}])
+    const service = yield* PermissionV2.Service
+    const saved = yield* PermissionSaved.Service
+    yield* saved.add({projectID:Project.ID.global,action:"codity_pr_publish",resources:["*"]})
+    const first = yield* service.ask(assertion({action:"codity_pr_publish",resources:["preview fingerprint"],save:[]}))
+    expect(first.effect).toBe("ask")
+    yield* service.reply({requestID:first.id,reply:"always"})
+    const second = yield* service.ask(assertion({id:PermissionV2.ID.create(),action:"codity_pr_publish",resources:["preview fingerprint"],save:[]}))
+    expect(second.effect).toBe("ask")
+    yield* service.reply({requestID:second.id,reply:"reject"})
+    yield* setRules([{action:"codity_pr_publish",resource:"*",effect:"deny"}])
+    expect((yield* service.ask(assertion({action:"codity_pr_publish"}))).effect).toBe("deny")
+  }))
+  it.effect("deployment approval cannot be bypassed by saved or configured allow rules", () => Effect.gen(function* () {
+    yield* setup([{action:"*",resource:"*",effect:"allow"}])
+    const service = yield* PermissionV2.Service
+    const saved = yield* PermissionSaved.Service
+    yield* saved.add({projectID:Project.ID.global,action:"codity_deployment",resources:["*"]})
+    const first = yield* service.ask(assertion({action:"codity_deployment",resources:["preview fingerprint"],save:[]}))
+    expect(first.effect).toBe("ask")
+    yield* service.reply({requestID:first.id,reply:"always"})
+    const second = yield* service.ask(assertion({id:PermissionV2.ID.create(),action:"codity_deployment",resources:["preview fingerprint"],save:[]}))
+    expect(second.effect).toBe("ask")
+    yield* service.reply({requestID:second.id,reply:"reject"})
+    yield* setRules([{action:"codity_deployment",resource:"*",effect:"deny"}])
+    expect((yield* service.ask(assertion({action:"codity_deployment"}))).effect).toBe("deny")
+  }))
   it.effect("returns the evaluated effect and only queues prompts", () =>
     Effect.gen(function* () {
       yield* setup([{ action: "read", resource: "*", effect: "allow" }])

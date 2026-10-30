@@ -158,6 +158,7 @@ const layer = Layer.effect(
       const all = [...rules, ...(yield* savedRules())]
       const effects = input.resources.map((resource) => evaluate(input.action, resource, all).effect)
       const effect: Permission.Effect = effects.includes("deny") ? "deny" : effects.includes("ask") ? "ask" : "allow"
+      if (["codity_pr_publish", "codity_deployment"].includes(input.action) && effect !== "deny") return { effect: "ask" as const, rules: all }
       return { effect, rules: all }
     })
 
@@ -260,6 +261,7 @@ const layer = Layer.effect(
 
           const rememberedRules = yield* savedRules()
           for (const [id, item] of pending) {
+            if (["codity_pr_publish", "codity_deployment"].includes(item.request.action)) continue
             const input = { ...item.request }
             const rules = yield* configured(item.request.sessionID, item.agent).pipe(
               EffectRuntime.catchTag("Session.NotFoundError", () => EffectRuntime.succeed(undefined)),
