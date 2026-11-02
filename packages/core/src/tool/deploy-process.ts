@@ -23,6 +23,7 @@ export async function deployProcess(input: {
   recipePath?: string
   cwd: string
   signal?: AbortSignal
+  onProgress?: (message: string) => Promise<void>
   approve: (request: DeploymentPermission) => Promise<void>
 }) {
   if (!binding || input.operationID !== binding.operation_id) throw new Error("No managed deployment is bound to this session")
@@ -45,6 +46,11 @@ export async function deployProcess(input: {
       const parsed: unknown = JSON.parse(line)
       if (!parsed || typeof parsed !== "object") throw new Error("Invalid deployment response")
       const value = parsed as Record<string, unknown>
+      if (typeof value.progress === "string") {
+        if (value.operation_id !== input.operationID || value.progress.length > 4096 || /[\x00-\x1f\x7f]/.test(value.progress)) throw new Error("Invalid deployment progress")
+        await input.onProgress?.(value.progress)
+        continue
+      }
       if (value.permission_required === true && value.permission && typeof value.permission === "object") {
         const request = value.permission as Record<string, unknown>
         if (request.operation_id !== input.operationID || typeof request.challenge !== "string" || typeof request.preview !== "string" || typeof request.root !== "string" || realpathSync(request.root) !== realpathSync(input.cwd)) throw new Error("Deployment permission belongs to another operation or repository")

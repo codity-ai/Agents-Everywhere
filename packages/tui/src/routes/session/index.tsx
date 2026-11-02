@@ -81,6 +81,7 @@ import { getRevertDiffFiles } from "../../util/revert-diff"
 import { AGENTS_EVERYWHERE_BASE_MODE, useBindings, useCommandShortcut, useAgentsEverywhereKeymap } from "../../keymap"
 import { usePathFormatter } from "../../context/path-format"
 import { LocationProvider } from "../../context/location"
+import { completionBinding, completionRequest } from "../../util/pr-completion"
 
 addDefaultParsers(parsers.parsers)
 
@@ -354,6 +355,46 @@ export function Session() {
   const dialog = useDialog()
   const renderer = useRenderer()
 
+  const publishCompletion = (() => {
+    try { return completionBinding() } catch { return undefined }
+  })()
+  let completionBusy = false
+  let offeredCompletion: string | undefined
+  let completionTimer: ReturnType<typeof setTimeout> | undefined
+  onCleanup(() => clearTimeout(completionTimer))
+  const offerPullRequest = async (manual = false) => {
+    if (!publishCompletion || publishCompletion.sessionID !== route.sessionID || completionBusy || dialog.stack.length > 0) return
+    if (sync.data.session_status[route.sessionID]?.type !== "idle" || disabled()) return
+    completionBusy = true
+    try {
+      const status = await completionRequest(publishCompletion, "inspect")
+      if (!status.ready) {
+        if (manual) toast.show({ message: "No local changes or unpushed commits to publish.", variant: "info" })
+        return
+      }
+      renderer.suspend()
+      let result
+      try { result = await completionRequest(publishCompletion, "complete") }
+      finally { renderer.resume() }
+      if (result.state === "created") await DialogAlert.show(dialog, "Pull Request created", result.message || "Pull Request created")
+      else toast.show({ message: result.message || "Continue chatting, type /pr when ready, or /exit to finish.", variant: result.state === "failed" ? "error" : "info", duration: 12000 })
+    } catch (error) {
+      toast.show({ message: error instanceof Error ? error.message : "PR completion is unavailable. Your local work is preserved.", variant: "error" })
+    } finally { completionBusy = false }
+  }
+  createEffect(() => {
+    if (!publishCompletion || publishCompletion.sessionID !== route.sessionID) return
+    if (sync.data.session_status[route.sessionID]?.type !== "idle") return
+    const assistant = messages().filter((message): message is AssistantMessage => message.role === "assistant").at(-1)
+    if (!assistant?.time.completed || assistant.time.completed < publishCompletion.startedAt || assistant.error || assistant.id === offeredCompletion) return
+    const todos = sync.data.todo[route.sessionID] || []
+    if (todos.some((todo) => todo.status === "pending" || todo.status === "in_progress")) return
+    offeredCompletion = assistant.id
+    // Observe store snapshots too: attach can miss the first busy SSE event.
+    clearTimeout(completionTimer)
+    completionTimer = setTimeout(() => { void offerPullRequest() }, 250)
+  })
+
   event.on("session.status", (evt) => {
     if (evt.properties.sessionID !== route.sessionID) return
     if (evt.properties.status.type !== "retry") return
@@ -463,6 +504,14 @@ export function Session() {
   }
 
   const sessionCommandList = createMemo(() => [
+    {
+      title: "Create a Pull Request",
+      value: "session.create-pr",
+      category: "Session",
+      enabled: Boolean(publishCompletion && publishCompletion.sessionID === route.sessionID),
+      slash: { name: "pr" },
+      run: async () => { dialog.clear(); await offerPullRequest(true) },
+    },
     {
       title: session()?.share?.url ? "Copy share link" : "Share session",
       value: "session.share",
@@ -1798,9 +1847,9 @@ type ToolProps = {
 function GenericTool(props: ToolProps) {
   const { theme } = useTheme()
   const ctx = use()
-  const output = createMemo(() => props.output?.trim() ?? "")
+  const output = createMemo(() => (props.tool === "codity_deploy" ? stringValue(props.metadata.output) : undefined)?.trim() || props.output?.trim() || "")
   const [expanded, setExpanded] = createSignal(false)
-  const maxLines = 3
+  const maxLines = props.tool === "codity_deploy" ? 8 : 3
   const maxChars = createMemo(() => maxLines * Math.max(20, ctx.width - 6))
   const collapsed = createMemo(() => collapseToolOutput(output(), maxLines, maxChars()))
   const limited = createMemo(() => {
@@ -1810,7 +1859,7 @@ function GenericTool(props: ToolProps) {
 
   return (
     <Show
-      when={props.output && ctx.showGenericToolOutput()}
+      when={output() && (props.tool === "codity_deploy" || ctx.showGenericToolOutput())}
       fallback={
         <InlineTool icon="⚙" pending="Writing command…" complete={true} part={props.part}>
           {props.tool} {input(props.input)}
