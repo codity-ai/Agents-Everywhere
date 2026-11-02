@@ -12,20 +12,29 @@ lines.on('line',line=>{const value=JSON.parse(line);if(!start){start=value;if(pr
 if(value.challenge!=='fresh'||value.approved!==true)process.exit(12);process.stdout.write(JSON.stringify({operation_id:start.operation_id,progress:'[1/3] Probing mount... Verified'})+'\\n');process.stdout.write(JSON.stringify({result:{operation_id:start.operation_id,state:'awaiting_approval'}})+'\\n');process.exit(0);});
 `)
   await chmod(executable, 0o700)
-  const oldPath = process.env.PATH
-  process.env.PATH = dir + path.delimiter + oldPath
-  process.env.CODITY_DEPLOYMENT_BINDING = JSON.stringify({ bridge_url: "http://127.0.0.1:1/deploy", token: "private-secret", operation_id: id })
   try {
-    const { deployProcess } = await import("../src/tool/deploy-process")
-    expect(process.env.CODITY_DEPLOYMENT_BINDING).toBeUndefined()
-    await expect(deployProcess({ operationID: "unrelated", action: "apply", cwd: dir, approve: async () => {} })).rejects.toThrow("bound")
-    await expect(deployProcess({ operationID: id, action: "prepare", cwd: dir, approve: async () => { throw new Error("denied") } })).rejects.toThrow("denied")
-    let requests = 0
-    const progress: string[] = []
-    const result = await deployProcess({ operationID: id, action: "prepare", cwd: dir, onProgress: async (line) => { progress.push(line) }, approve: async (request) => { requests++; expect(request.preview).toBe("Concrete recipe") } })
-    expect(requests).toBe(1)
-    expect(progress).toEqual(["[1/3] Probing mount... Verified"])
-    expect(JSON.parse(result).state).toBe("awaiting_approval")
-    expect(result).not.toContain("private-secret")
-  } finally { process.env.PATH = oldPath; delete process.env.CODITY_DEPLOYMENT_BINDING; await rm(dir, { recursive: true, force: true }) }
+    // Binding capture happens once at process startup, independent of the suite's module cache.
+    const runner = path.join(dir, "runner.ts")
+    await writeFile(runner, `import assert from "node:assert/strict"
+import { deployProcess } from ${JSON.stringify(new URL("../src/tool/deploy-process.ts", import.meta.url).href)}
+assert.equal(process.env.CODITY_DEPLOYMENT_BINDING, undefined)
+await assert.rejects(deployProcess({ operationID: "unrelated", action: "apply", cwd: process.cwd(), approve: async () => {} }), /bound/)
+await assert.rejects(deployProcess({ operationID: ${JSON.stringify(id)}, action: "prepare", cwd: process.cwd(), approve: async () => { throw new Error("denied") } }), /denied/)
+let requests = 0
+const progress: string[] = []
+const result = await deployProcess({ operationID: ${JSON.stringify(id)}, action: "prepare", cwd: process.cwd(), onProgress: async (line) => { progress.push(line) }, approve: async (request) => { requests++; assert.equal(request.preview, "Concrete recipe") } })
+assert.equal(requests, 1)
+assert.deepEqual(progress, ["[1/3] Probing mount... Verified"])
+assert.equal(JSON.parse(result).state, "awaiting_approval")
+assert.ok(!result.includes("private-secret"))
+`)
+    const child = Bun.spawn([process.execPath, runner], {
+      cwd: dir,
+      env: { ...process.env, PATH: dir + path.delimiter + process.env.PATH, CODITY_DEPLOYMENT_BINDING: JSON.stringify({ bridge_url: "http://127.0.0.1:1/deploy", token: "private-secret", operation_id: id }) },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()])
+    expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" })
+  } finally { await rm(dir, { recursive: true, force: true }) }
 })
